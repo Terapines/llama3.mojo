@@ -1,7 +1,8 @@
 from tensor import Tensor, TensorShape
 from algorithm import vectorize
+from math import abs, round
 
-alias nelts_u8 = (4 * simdwidthof[UInt8]())
+alias nelts_q8 = (4 * simdwidthof[Int8]())
 alias nelts_f32 = (4 * simdwidthof[Float32]())
 
 
@@ -11,8 +12,9 @@ struct TensorSlice[type: DType]:
 
     Parameters:
         type: The data type of the tensor.
-    
+
     """
+
     var _data: DTypePointer[type]
     var _shape: TensorShape
 
@@ -66,24 +68,24 @@ struct TensorSlice[type: DType]:
 
 @value
 struct QuantizedTensor:
-    """An 8-bit quantized tensor.
+    """An 8-bit quantized tensor."""
 
-    """
-
-    var _quantized: TensorSlice[DType.uint8]
+    var _quantized: TensorSlice[DType.int8]
     var _scale: TensorSlice[DType.float32]
     var _group_size: Int
 
     fn __init__(
         inout self,
-        ptr: DTypePointer[DType.uint8],
+        ptr: DTypePointer[DType.int8],
         shape: TensorShape,
         scale_ptr: DTypePointer[DType.float32],
         group_size: Int,
     ):
-        self._quantized = TensorSlice[DType.uint8](ptr, shape)
+        self._quantized = TensorSlice[DType.int8](ptr, shape)
         var num_scale_factors = self._quantized.num_elements() // group_size
-        self._scale = TensorSlice[DType.float32](scale_ptr, TensorShape(num_scale_factors))
+        self._scale = TensorSlice[DType.float32](
+            scale_ptr, TensorShape(num_scale_factors)
+        )
         self._group_size = group_size
 
     fn dequantize(self, dequantized: TensorSlice[DType.float32]):
@@ -99,10 +101,14 @@ struct QuantizedTensor:
             var group = i // self._group_size
             var scale_factor = self._scale[group]
 
-            var quantized_lane = self._quantized.load[width=simd_width](i).cast[DType.float32]()
-            dequantized.store[width=simd_width](i, quantized_lane * scale_factor)
+            var quantized_lane = self._quantized.load[width=simd_width](i).cast[
+                DType.float32
+            ]()
+            dequantized.store[width=simd_width](
+                i, quantized_lane * scale_factor
+            )
 
-        vectorize[_dequantize, nelts_u8](num_elements)
+        vectorize[_dequantize, nelts_q8](num_elements)
 
     fn quantize(inout self, dequantized: TensorSlice[DType.float32]) raises:
         """Quantize the `dequantized` and update self.
@@ -111,14 +117,49 @@ struct QuantizedTensor:
             dequantized: A tensor with float32 values to quantize.
         """
 
+        if dequantized.shape() != self._quantized.shape():
+            raise Error("shape mismatch")
+
         var num_elements = dequantized.num_elements()
-        
+
         if num_elements % self._group_size != 0:
             raise Error("number of elements must be a multiple of group size")
 
-        # TODO: Implement quantization
+        var num_groups = num_elements // self._group_size
 
-        pass
+        var Q_MAX: Float32 = 127.0
+
+        for group in range(num_groups):
+            var wmax: Float32 = 0.0
+
+            @parameter
+            fn _find_wmax[simd_width: Int](i: Int):
+                var dequantized_lane = dequantized.load[width=simd_width](
+                    group * self._group_size + i
+                )
+                var local_wmax = abs(dequantized_lane).reduce_max()
+                if local_wmax > wmax:
+                    wmax = local_wmax
+
+            vectorize[_find_wmax, nelts_f32](self._group_size)
+
+            var scale_factor = wmax / Q_MAX
+            self._scale.store[width=1](group, scale_factor)
+
+            # calculate and write back the quantized values
+            @parameter
+            fn _quantize[simd_width: Int](i: Int):
+                var dequantized_lane = dequantized.load[width=simd_width](
+                    group * self._group_size + i
+                )
+                var quantized_lane = round[DType.float32, simd_width](
+                    dequantized_lane / scale_factor
+                ).cast[DType.int8]()
+                self._quantized.store[width=simd_width](
+                    group * self._group_size + i, quantized_lane
+                )
+
+            vectorize[_quantize, nelts_f32](self._group_size)
 
 
 fn wrap(token: String) -> String:
@@ -190,6 +231,7 @@ struct Tokenizer:
             return index.value()[]
         return -1
 
+
 fn str_concat(s1: String, s2: String) -> String:
     var l1 = len(s1)
     var l2 = len(s2)
@@ -237,7 +279,8 @@ fn bpe_encode(inout tokens: List[Int], text: String, tok: Tokenizer):
         for i in range(best_idx + 2, len(tokens)):
             _tokens.append(tokens[i])
         tokens = _tokens^
-        
+
+
 def main():
     var name = StringRef("tokenizer.bin")
     var tok = Tokenizer(128256, name)
