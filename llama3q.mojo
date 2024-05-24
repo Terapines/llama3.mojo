@@ -4,6 +4,7 @@ from math import abs, round
 
 alias nelts_q8 = (4 * simdwidthof[Int8]())
 alias nelts_f32 = (4 * simdwidthof[Float32]())
+alias NUM_CONFIG_HEADER_BYTES = 256
 
 
 @value
@@ -280,6 +281,97 @@ fn bpe_encode(inout tokens: List[Int], text: String, tok: Tokenizer):
             _tokens.append(tokens[i])
         tokens = _tokens^
 
+
+fn read_bytes_as[dtype: DType](inout f: FileHandle, size: Int) raises -> SIMD[dtype, 1]:
+    var bytes = f.read_bytes(size)
+    var result = bytes.data.bitcast[SIMD[dtype, 1]]()[0]
+    _ = bytes
+    return result
+
+#  Header (256 bytes)
+#  ------------------
+#  4 bytes:  Magic number ("ak42" - 0x616b3432)       // uint32
+#  4 bytes:  Version (2)                              // int32
+#  4 bytes:  Model dimension (p.dim)                  // int32
+#  4 bytes:  Hidden dimension (FF layer)              // int32
+#  4 bytes:  Number of layers (p.n_layers)            // int32
+#  4 bytes:  Number of attention heads (p.n_heads)    // int32
+#  4 bytes:  Number of key-value heads (n_kv_heads)   // int32
+#  4 bytes:  Vocabulary size (p.vocab_size)           // int32
+#  4 bytes:  Max sequence length (p.max_seq_len)      // int32
+#  1 byte:   Shared classifier flag                   // uint8
+#  4 bytes:  Group size for quantization              // int32
+#  Remaining: Zero padding to 256 bytes               // uint8[]
+#  
+#  FP32 Norm Parameters
+#  --------------------
+#  Attention norm weights (each layer)                // float32[]
+#  Feed-forward norm weights (each layer)             // float32[]
+#  Final norm weight before classifier                // float32[]
+#  
+#  Quantized Weights (Q8_0)
+#  ------------------------
+#  For each weight matrix:
+#  - Quantized int8 weights                           // int8[]
+#  - Scale factors (FP32)                             // float32[]
+
+struct Config:
+    var version: Int32
+    var dim: Int32
+    var kv_dim: Int32
+    var hidden_dim: Int32
+    var n_layers: Int32
+    var n_heads: Int32
+    var n_kv_heads: Int32
+    var kv_mul: Int32
+    var vocab_size: Int32
+    var seq_len: Int32
+    var head_size: Int32
+    var shared_weights: Bool
+    var group_size: Int32
+    """
+    Parameters:
+        version: The version of the model.
+        dim: The model dimension.
+        kv_dim: The key-value dimension.
+        hidden_dim: The hidden dimension.
+        n_layers: The number of layers.
+        n_heads: The number of attention heads.
+        n_kv_heads: The number of key-value heads.
+        kv_mul: The key-value multiplier.
+        vocab_size: The vocabulary size.
+        seq_len: The maximum sequence length.
+        head_size: The head size.
+        shared_weights: Whether the weights are shared.
+        group_size: The group size for quantization.
+    """
+
+    fn __init__(inout self, fileName: String, print_config: Bool) raises:
+        with open(fileName, "rb") as f:
+            var magic = read_bytes_as[DType.uint32](f, 4)
+            if magic != 0x616b3432:
+                raise Error("Invalid magic number")
+            self.version = read_bytes_as[DType.int32](f, 4)
+            self.dim = read_bytes_as[DType.int32](f, 4)
+            self.hidden_dim = read_bytes_as[DType.int32](f, 4)
+            self.n_layers = read_bytes_as[DType.int32](f, 4)
+            self.n_heads = read_bytes_as[DType.int32](f, 4)
+            self.n_kv_heads = read_bytes_as[DType.int32](f, 4)
+            self.vocab_size = read_bytes_as[DType.int32](f, 4)
+            self.seq_len = read_bytes_as[DType.int32](f, 4)
+            self.shared_weights = read_bytes_as[DType.uint8](f, 1) == 1
+            self.group_size = read_bytes_as[DType.int32](f, 4)
+            self.head_size = self.dim // self.n_heads
+            self.kv_dim = (self.n_kv_heads * self.dim) // self.n_heads
+            self.kv_mul = self.n_heads // self.n_kv_heads
+
+        if print_config:
+            print("config: dim, hidden_dim", self.dim, self.hidden_dim)
+            print("config: n_layers, n_heads", self.n_layers, self.n_heads)
+            print("config: vocab_size, seq_len", self.vocab_size, self.seq_len)
+            print("config: head_size", self.head_size)
+            print("config: kv_dim, kv_mul", self.kv_dim, self.kv_mul)
+            print("config: shared_weights, group_size", self.shared_weights, self.group_size)
 
 def main():
     var name = StringRef("tokenizer.bin")
