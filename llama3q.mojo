@@ -1,5 +1,5 @@
-from tensor import Tensor, TensorShape
-from algorithm import vectorize
+from tensor import Tensor, TensorShape, rand
+from algorithm import vectorize, parallelize
 from math import abs, round
 
 alias nelts_q8 = (4 * simdwidthof[Int8]())
@@ -71,22 +71,18 @@ struct TensorSlice[type: DType]:
 struct QuantizedTensor:
     """An 8-bit quantized tensor."""
 
-    var _quantized: TensorSlice[DType.int8]
-    var _scale: TensorSlice[DType.float32]
+    var _quantized: Tensor[DType.int8]
+    var _scale: Tensor[DType.float32]
     var _group_size: Int
 
     fn __init__(
         inout self,
-        ptr: DTypePointer[DType.int8],
         shape: TensorShape,
-        scale_ptr: DTypePointer[DType.float32],
         group_size: Int,
     ):
-        self._quantized = TensorSlice[DType.int8](ptr, shape)
+        self._quantized = Tensor[DType.int8](shape)
         var num_scale_factors = self._quantized.num_elements() // group_size
-        self._scale = TensorSlice[DType.float32](
-            scale_ptr, TensorShape(num_scale_factors)
-        )
+        self._scale = Tensor[DType.float32](TensorShape(num_scale_factors))
         self._group_size = group_size
 
     fn dequantize(self, dequantized: TensorSlice[DType.float32]):
@@ -96,20 +92,42 @@ struct QuantizedTensor:
             dequantized: The tensor to store the dequantized values.
         """
         var num_elements = self._quantized.num_elements()
+        var num_groups = num_elements // self._group_size
 
+        # iterate over the groups
         @parameter
-        fn _dequantize[simd_width: Int](i: Int):
+        fn dequantize_group(group: Int):
+            var scale_factor = self._scale[group]
+
+            # dequantize the group
+            @parameter
+            fn _dequantize[simd_width: Int](i: Int):
+                var quantized_lane = self._quantized.load[width=simd_width](
+                    group * self._group_size + i
+                ).cast[DType.float32]()
+                dequantized.store[width=simd_width](
+                    group * self._group_size + i, quantized_lane * scale_factor
+                )
+
+            vectorize[_dequantize, nelts_q8](self._group_size)
+
+        parallelize[dequantize_group](num_groups, num_groups)
+
+    fn dequantize_naive(self, dequantized: TensorSlice[DType.float32]):
+        """Dequantize the tensor into `dequantized`. Uses a naive implementation.
+
+        Args:
+            dequantized: The tensor to store the dequantized values.
+        """
+        var num_elements = self._quantized.num_elements()
+
+        for i in range(num_elements):
             var group = i // self._group_size
             var scale_factor = self._scale[group]
 
-            var quantized_lane = self._quantized.load[width=simd_width](i).cast[
-                DType.float32
-            ]()
-            dequantized.store[width=simd_width](
-                i, quantized_lane * scale_factor
-            )
+            var quantized_lane = self._quantized.load[width=1](i).cast[DType.float32]()
+            dequantized.store[width=1](i, quantized_lane * scale_factor)
 
-        vectorize[_dequantize, nelts_q8](num_elements)
 
     fn quantize(inout self, dequantized: TensorSlice[DType.float32]) raises:
         """Quantize the `dequantized` and update self.
@@ -119,7 +137,7 @@ struct QuantizedTensor:
         """
 
         if dequantized.shape() != self._quantized.shape():
-            raise Error("shape mismatch")
+            raise Error("shape mismatch, expected: " + str(self._quantized.shape()) + ", got: " + str(dequantized.shape()))
 
         var num_elements = dequantized.num_elements()
 
@@ -130,7 +148,8 @@ struct QuantizedTensor:
 
         var Q_MAX: Float32 = 127.0
 
-        for group in range(num_groups):
+        @parameter
+        fn quantize_group(group: Int):
             var wmax: Float32 = 0.0
 
             @parameter
@@ -161,9 +180,59 @@ struct QuantizedTensor:
                 )
 
             vectorize[_quantize, nelts_f32](self._group_size)
+        
+        parallelize[quantize_group](num_groups, num_groups)
+    
+    fn quantize_naive(inout self, dequantized: TensorSlice[DType.float32]) raises:
+        """Quantize the `dequantized` and update self. Uses a naive implementation.
+
+        Args:
+            dequantized: A tensor with float32 values to quantize.
+        """
+
+        if dequantized.shape() != self._quantized.shape():
+            raise Error("shape mismatch, expected: " + str(self._quantized.shape()) + ", got: " + str(dequantized.shape()))
+
+        var num_elements = dequantized.num_elements()
+
+        if num_elements % self._group_size != 0:
+            raise Error("number of elements must be a multiple of group size")
+
+        var num_groups = num_elements // self._group_size
+
+        var Q_MAX: Float32 = 127.0
+
+        for group in range(num_groups):
+            var wmax: Float32 = 0.0
+
+            for i in range(self._group_size):
+                var dequantized_lane = dequantized.load[width=1](
+                    group * self._group_size + i
+                )
+                var local_wmax = abs(dequantized_lane)
+                if local_wmax > wmax:
+                    wmax = local_wmax
+
+            var scale_factor = wmax / Q_MAX
+            self._scale.store[width=1](group, scale_factor)
+
+            # calculate and write back the quantized values
+            for i in range(self._group_size):
+                var dequantized_lane = dequantized.load[width=1](
+                    group * self._group_size + i
+                )
+                var quantized_lane = round(dequantized_lane / scale_factor).cast[DType.int8]()
+                self._quantized.store[width=1](
+                    group * self._group_size + i, quantized_lane
+                )
 
 
 fn wrap(token: String) -> String:
+    """Wrap special characters in the token.
+
+    Args:
+        token: The token to wrap.
+    """
     alias a = String("\\n")
     alias b = String("\\t")
     alias c = String("'")
@@ -181,12 +250,18 @@ fn wrap(token: String) -> String:
 
 
 fn string_from_bytes(owned bytes: List[Int8]) -> String:
+    """Convert a list of bytes to a string.
+
+    Args:
+        bytes: The list of bytes to convert.
+    """
     bytes.append(0)
     return bytes^
 
 
 @value
 struct Tokenizer:
+    """A Byte Pair Encoding (BPE) tokenizer."""
     var vocab: List[String]
     var vocab_scores: List[Float32]
     var max_token_length: Int
@@ -218,7 +293,6 @@ struct Tokenizer:
                 var score = read_bytes_as[DType.float32](4)
                 var slen = int(read_bytes_as[DType.int32](4))
 
-                # print(slen)
 
                 var token = string_from_bytes(f.read_bytes(slen))
                 self.vocab.append(token^)
@@ -226,6 +300,14 @@ struct Tokenizer:
                 self.map_vocab_to_index[self.vocab[i]] = i
 
     fn find(self, token_o: String) -> Int:
+        """Find the index of the token in the vocabulary.
+
+        Args:
+            token_o: The token to find.
+
+        Returns:
+            The index of the token in the vocabulary.
+        """
         var token = wrap(token_o)
         var index = self.map_vocab_to_index.find(token)
         if index:
@@ -234,6 +316,12 @@ struct Tokenizer:
 
 
 fn str_concat(s1: String, s2: String) -> String:
+    """Concatenate two strings.
+
+    Args:
+        s1: The first string.
+        s2: The second string.
+    """
     var l1 = len(s1)
     var l2 = len(s2)
     var str = List[Int8](capacity=l1 + l2 + 1)
@@ -260,7 +348,9 @@ fn bpe_encode(inout tokens: List[Int], text: String, tok: Tokenizer):
 
         for i in range(len(tokens) - 1):
             # Check if we can merge the pair (tokens[i], tokens[i+1])
-            var str = str_concat(tok.vocab[tokens[i]], tok.vocab[tokens[i + 1]])
+            # var str = str_concat(tok.vocab[tokens[i]], tok.vocab[tokens[i + 1]])
+            # TODO: check: do we support add operator for string now?
+            var str = tok.vocab[tokens[i]] + tok.vocab[tokens[i + 1]]
             var id = tok.find(str)
             if id != -1 and tok.vocab_scores[id] > best_score:
                 best_score = tok.vocab_scores[id]
@@ -282,40 +372,14 @@ fn bpe_encode(inout tokens: List[Int], text: String, tok: Tokenizer):
         tokens = _tokens^
 
 
-fn read_bytes_as[dtype: DType](inout f: FileHandle, size: Int) raises -> SIMD[dtype, 1]:
-    var bytes = f.read_bytes(size)
+fn read_bytes_as[dtype: DType](inout f: FileHandle) raises -> SIMD[dtype, 1]:
+    var bytes = f.read_bytes(sizeof[dtype]())
     var result = bytes.data.bitcast[SIMD[dtype, 1]]()[0]
     _ = bytes
     return result
 
-#  Header (256 bytes)
-#  ------------------
-#  4 bytes:  Magic number ("ak42" - 0x616b3432)       // uint32
-#  4 bytes:  Version (2)                              // int32
-#  4 bytes:  Model dimension (p.dim)                  // int32
-#  4 bytes:  Hidden dimension (FF layer)              // int32
-#  4 bytes:  Number of layers (p.n_layers)            // int32
-#  4 bytes:  Number of attention heads (p.n_heads)    // int32
-#  4 bytes:  Number of key-value heads (n_kv_heads)   // int32
-#  4 bytes:  Vocabulary size (p.vocab_size)           // int32
-#  4 bytes:  Max sequence length (p.max_seq_len)      // int32
-#  1 byte:   Shared classifier flag                   // uint8
-#  4 bytes:  Group size for quantization              // int32
-#  Remaining: Zero padding to 256 bytes               // uint8[]
-#  
-#  FP32 Norm Parameters
-#  --------------------
-#  Attention norm weights (each layer)                // float32[]
-#  Feed-forward norm weights (each layer)             // float32[]
-#  Final norm weight before classifier                // float32[]
-#  
-#  Quantized Weights (Q8_0)
-#  ------------------------
-#  For each weight matrix:
-#  - Quantized int8 weights                           // int8[]
-#  - Scale factors (FP32)                             // float32[]
-
 struct Config:
+    """Configuration of the model."""
     var version: Int32
     var dim: Int32
     var kv_dim: Int32
@@ -329,38 +393,48 @@ struct Config:
     var head_size: Int32
     var shared_weights: Bool
     var group_size: Int32
-    """
-    Parameters:
-        version: The version of the model.
-        dim: The model dimension.
-        kv_dim: The key-value dimension.
-        hidden_dim: The hidden dimension.
-        n_layers: The number of layers.
-        n_heads: The number of attention heads.
-        n_kv_heads: The number of key-value heads.
-        kv_mul: The key-value multiplier.
-        vocab_size: The vocabulary size.
-        seq_len: The maximum sequence length.
-        head_size: The head size.
-        shared_weights: Whether the weights are shared.
-        group_size: The group size for quantization.
-    """
 
     fn __init__(inout self, fileName: String, print_config: Bool) raises:
+        #  Header (256 bytes)
+        #  ------------------
+        #  4 bytes:  Magic number ("ak42" - 0x616b3432)       // uint32
+        #  4 bytes:  Version (2)                              // int32
+        #  4 bytes:  Model dimension (p.dim)                  // int32
+        #  4 bytes:  Hidden dimension (FF layer)              // int32
+        #  4 bytes:  Number of layers (p.n_layers)            // int32
+        #  4 bytes:  Number of attention heads (p.n_heads)    // int32
+        #  4 bytes:  Number of key-value heads (n_kv_heads)   // int32
+        #  4 bytes:  Vocabulary size (p.vocab_size)           // int32
+        #  4 bytes:  Max sequence length (p.max_seq_len)      // int32
+        #  1 byte:   Shared classifier flag                   // uint8
+        #  4 bytes:  Group size for quantization              // int32
+        #  Remaining: Zero padding to 256 bytes               // uint8[]
+        #  
+        #  FP32 Norm Parameters
+        #  --------------------
+        #  Attention norm weights (each layer)                // float32[]
+        #  Feed-forward norm weights (each layer)             // float32[]
+        #  Final norm weight before classifier                // float32[]
+        #  
+        #  Quantized Weights (Q8_0)
+        #  ------------------------
+        #  For each weight matrix:
+        #  - Quantized int8 weights                           // int8[]
+        #  - Scale factors (FP32)                             // float32[]
         with open(fileName, "rb") as f:
-            var magic = read_bytes_as[DType.uint32](f, 4)
+            var magic = read_bytes_as[DType.uint32](f)
             if magic != 0x616b3432:
                 raise Error("Invalid magic number")
-            self.version = read_bytes_as[DType.int32](f, 4)
-            self.dim = read_bytes_as[DType.int32](f, 4)
-            self.hidden_dim = read_bytes_as[DType.int32](f, 4)
-            self.n_layers = read_bytes_as[DType.int32](f, 4)
-            self.n_heads = read_bytes_as[DType.int32](f, 4)
-            self.n_kv_heads = read_bytes_as[DType.int32](f, 4)
-            self.vocab_size = read_bytes_as[DType.int32](f, 4)
-            self.seq_len = read_bytes_as[DType.int32](f, 4)
-            self.shared_weights = read_bytes_as[DType.uint8](f, 1) == 1
-            self.group_size = read_bytes_as[DType.int32](f, 4)
+            self.version = read_bytes_as[DType.int32](f)
+            self.dim = read_bytes_as[DType.int32](f)
+            self.hidden_dim = read_bytes_as[DType.int32](f)
+            self.n_layers = read_bytes_as[DType.int32](f)
+            self.n_heads = read_bytes_as[DType.int32](f)
+            self.n_kv_heads = read_bytes_as[DType.int32](f)
+            self.vocab_size = read_bytes_as[DType.int32](f)
+            self.seq_len = read_bytes_as[DType.int32](f)
+            self.shared_weights = read_bytes_as[DType.uint8](f) == 1
+            self.group_size = read_bytes_as[DType.int32](f)
             self.head_size = self.dim // self.n_heads
             self.kv_dim = (self.n_kv_heads * self.dim) // self.n_heads
             self.kv_mul = self.n_heads // self.n_kv_heads
@@ -373,12 +447,148 @@ struct Config:
             print("config: kv_dim, kv_mul", self.kv_dim, self.kv_mul)
             print("config: shared_weights, group_size", self.shared_weights, self.group_size)
 
+@value
+struct RunState:
+    var x: Tensor[DType.float32]  # activation at current time stamp (dim,)
+    var xb: Tensor[DType.float32]  # same, but inside a residual branch (dim,)
+    var xb2: Tensor[DType.float32]  # an additional buffer just for convenience (dim,)
+    var hb: Tensor[DType.float32]  # buffer for hidden dimension in the ffn (hidden_dim,)
+    var hb2: Tensor[DType.float32]  # buffer for hidden dimension in the ffn (hidden_dim,)
+    var q: Tensor[DType.float32]  # query (dim,)
+    var k: TensorSlice[DType.float32]  # key (kv_dim,)
+    var v: TensorSlice[DType.float32]  # value (kv_dim,)
+    var att: Tensor[DType.float32]  # buffer for scores/attention values (n_heads, seq_len)
+    var logits: Tensor[DType.float32]  # output logits
+    var key_cache: Tensor[DType.float32]  # (layer, seq_len, dim)
+    var value_cache: Tensor[DType.float32]  # (layer, seq_len, dim)
+    var x_q: QuantizedTensor # quantized x (dim,)
+    var hb_q: QuantizedTensor # quantized hb (hidden_dim,)
+
+    fn __init__(inout self, config: Config) raises:
+        self.x = Tensor[DType.float32](config.dim)
+        self.xb = Tensor[DType.float32](config.dim)
+        self.xb2 = Tensor[DType.float32](config.dim)
+        self.hb = Tensor[DType.float32](config.hidden_dim)
+        self.hb2 = Tensor[DType.float32](config.hidden_dim)
+        self.q = Tensor[DType.float32](config.dim)
+        self.att = Tensor[DType.float32](TensorShape((config.n_heads, config.seq_len)))
+        self.logits = Tensor[DType.float32](config.vocab_size)
+        self.key_cache = Tensor[DType.float32](TensorShape((
+            config.n_layers, config.seq_len, config.kv_dim
+        )))
+        self.value_cache = Tensor[DType.float32](TensorShape((
+            config.n_layers, config.seq_len, config.kv_dim
+        )))
+        # So their updates flow to the caches, k and v are slices with shared memory.
+        # Initialize with placeholders. The real tensors reference layer and position during forward pass.
+        self.k = TensorSlice(Tensor[DType.float32](TensorShape((1, config.kv_dim))), 1)
+        self.v = TensorSlice(Tensor[DType.float32](TensorShape((1, config.kv_dim))), 1)
+        self.x_q = QuantizedTensor(
+            TensorShape(config.dim),
+            int(config.group_size)
+        )
+        self.hb_q = QuantizedTensor(
+            TensorShape(config.hidden_dim),
+            int(config.group_size)
+        )
+
+def test():
+    def test_quantized_tensor():
+        alias N = 4096
+        alias group_size = 512
+        print("QuantizedTensor test")
+        var qt = QuantizedTensor(
+            TensorShape(N),
+            int(group_size)
+        )
+        var qt_naive = QuantizedTensor(
+            TensorShape(N),
+            int(group_size)
+        )
+
+        var x = rand[DType.float32](5, N) - 0.5
+
+        var x_1 = TensorSlice[DType.float32](x, 0)
+        var x_1_naive = TensorSlice[DType.float32](x, 0)
+        # print("Original:")
+        # print(x_1.load[width=N](0))
+
+        qt.quantize(x_1)
+        qt_naive.quantize_naive(x_1_naive)
+
+        # print("Quantized:")
+        # print(qt._quantized.load[width=N](0))
+
+        # print("Quantized (naive):")
+        # print(qt_naive._quantized.load[width=N](0))
+
+        # print("Scale factors:")
+        # print(qt._scale.load[width=N // group_size](0))
+
+        # print("Scale factors (naive):")
+        # print(qt_naive._scale.load[width=N // group_size](0))
+
+        var x_2 = TensorSlice[DType.float32](x, 3)
+        var x_2_naive = TensorSlice[DType.float32](x, 4)
+
+        qt.dequantize(x_2)
+        qt_naive.dequantize_naive(x_2_naive)
+
+        # print("Dequantized:")
+        # print(x_2.load[width=N](0))
+
+        # print("Dequantized (naive):")
+        # print(x_2_naive.load[width=N](0))
+
+        var error = x_1.load[width=N](0) - x_2.load[width=N](0)
+        var error_naive = x_1_naive.load[width=N](0) - x_2_naive.load[width=N](0)
+
+        # print("Error:")
+        # print(error)
+
+        # print("Error (naive):")
+        # print(error_naive)
+
+        var max_error = abs(error).reduce_max()
+        print("Max error:", max_error)
+
+        var max_error_naive = abs(error_naive).reduce_max()
+        print("Max error (naive):", max_error_naive)
+
+        if max_error != max_error_naive:
+            print("Error: max_error != max_error_naive")
+            return
+
+        if max_error > 1e-2:
+            print("Error: max_error > 1e-2")
+            return
+
+        print("QuantizedTensor test passed")
+
+        _ = x
+
+
+    def test_bpe_encode():
+        print("BPE encode test")
+
+        var name = StringRef("tokenizer.bin")
+        var tok = Tokenizer(128256, name)
+        var prompt_tokens = List[Int]()
+        var gt = SIMD[DType.int32, 8](9906, 11, 1268, 527, 499, 30)
+
+        bpe_encode(prompt_tokens, "Hello, how are you?", tok)
+
+        for i in range(len(prompt_tokens)):
+            if(prompt_tokens[i] != int(gt[i])):
+                print("Error at index ", i)
+                print("Expected: ", gt[i])
+                print("Got: ", prompt_tokens[i])
+        
+        print("BPE encode test passed")
+    
+    test_quantized_tensor()
+    test_bpe_encode()
+
 def main():
-    var name = StringRef("tokenizer.bin")
-    var tok = Tokenizer(128256, name)
-    var prompt_tokens = List[Int]()
-
-    bpe_encode(prompt_tokens, "Hello, how are you?", tok)
-
-    for i in range(len(prompt_tokens)):
-        print(prompt_tokens[i])
+    test()
+    
