@@ -601,6 +601,8 @@ struct TransformerWeights:
             @parameter
             fn read_weights_fp32(shape: TensorShape) raises -> Tensor[DType.float32]:
                 var bytes = f.read_bytes(shape.num_elements() * sizeof[DType.float32]())
+                if bytes.size != shape.num_elements() * sizeof[DType.float32]():
+                    raise Error("EOF while reading weights")
                 bytes_read += bytes.size
                 var data = bytes.steal_data().bitcast[Float32]()
                 
@@ -624,12 +626,16 @@ struct TransformerWeights:
 
                     # read int8 weights
                     var weight_bytes = f.read_bytes(shape.num_elements() // n_layers * sizeof[DType.int8]())
+                    if weight_bytes.size != shape.num_elements() // n_layers * sizeof[DType.int8]():
+                        raise Error("EOF while reading weights")
                     var weight_size = weight_bytes.size
                     bytes_read += weight_size
                     var weight_data = weight_bytes.steal_data()
                     
                     # read scale factors
                     var scale_bytes = f.read_bytes(shape.num_elements() // n_layers // config.group_size * sizeof[DType.float32]())
+                    if scale_bytes.size != shape.num_elements() // n_layers // config.group_size * sizeof[DType.float32]():
+                        raise Error("EOF while reading scale factors")
                     var scale_size = scale_bytes.size
                     bytes_read += scale_size
                     var scale_data = scale_bytes.steal_data().bitcast[Float32]()
