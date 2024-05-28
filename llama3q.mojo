@@ -657,7 +657,7 @@ struct TransformerWeights:
             print("rms_ffn_weight done, bytes read:", bytes_read)
 
             # rms_final_weight
-            self.rms_final_weight = read_weights_fp32(TensorShape(config.n_layers, config.dim))
+            self.rms_final_weight = read_weights_fp32(TensorShape(config.dim))
             print("rms_final_weight done, bytes read:", bytes_read)
 
             # q_token_embedding_table
@@ -665,16 +665,16 @@ struct TransformerWeights:
             print("q_token_embedding_table done, bytes read:", bytes_read)
 
             # dequantize token_embedding_table
-            self.token_embedding_table = Tensor[DType.float32](TensorShape(1, config.vocab_size, config.dim))
+            self.token_embedding_table = Tensor[DType.float32](TensorShape(config.vocab_size, config.dim))
             print("token_embedding_table done, bytes read:", bytes_read)
-            self.q_token_embedding_table.dequantize(TensorSlice(self.token_embedding_table, 0))
+            self.q_token_embedding_table.dequantize(TensorSlice(self.token_embedding_table.data(), TensorShape(config.vocab_size, config.dim)))
             print("dequantize token_embedding_table done, bytes read:", bytes_read)
 
             # wq, wk, wv, wo
             self.wq = read_weights_i8(TensorShape(config.n_layers, config.dim, config.dim))
             self.wk = read_weights_i8(TensorShape(config.n_layers, config.kv_dim, config.dim))
             self.wv = read_weights_i8(TensorShape(config.n_layers, config.kv_dim, config.dim))
-            self.wo = read_weights_i8(TensorShape(config.n_layers, config.dim, config.kv_dim))
+            self.wo = read_weights_i8(TensorShape(config.n_layers, config.dim, config.dim))
             print("wq, wk, wv, wo done, bytes read:", bytes_read)
 
             # w1, w2, w3
