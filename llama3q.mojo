@@ -1,8 +1,12 @@
 from tensor import Tensor, TensorShape, rand
 from algorithm import vectorize, parallelize
 from math import abs, round
+from sys.info import num_performance_cores
+from memory import memset
 
+var workers = num_performance_cores()
 alias nelts_q8 = (4 * simdwidthof[Int8]())
+alias nelts_q32 = (4 * simdwidthof[Int32]())
 alias nelts_f32 = (4 * simdwidthof[Float32]())
 alias NUM_CONFIG_HEADER_BYTES = 256
 
@@ -65,7 +69,12 @@ struct TensorSlice[type: DType]:
 
     fn num_elements(self) -> Int:
         return self._shape.num_elements()
+    
+    fn dim(self, idx: Int) -> Int:
+        return self._shape[idx]
 
+    fn rank(self) -> Int:
+        return self._shape.rank()
 
 @value
 struct QuantizedTensor:
@@ -183,6 +192,9 @@ struct QuantizedTensor:
         
         parallelize[quantize_group](num_groups, num_groups)
     
+    fn rank(self) -> Int:
+        return self._quantized.rank()
+    
     fn quantize_naive(inout self, dequantized: TensorSlice[DType.float32]) raises:
         """Quantize the `dequantized` and update self. Uses a naive implementation.
 
@@ -225,6 +237,20 @@ struct QuantizedTensor:
                 self._quantized.store[width=1](
                     group * self._group_size + i, quantized_lane
                 )
+        
+    fn fill(inout self, quantized: Int8, scale: Float32):
+        """Fill the tensor with a constant value.
+
+        Args:
+            quantized: The quantized value to fill the tensor with.
+            scale: The scale factor to fill the tensor with.
+        """
+
+        for i in range(self._quantized.num_elements()):
+            self._quantized.store[width=1](i, quantized)
+        
+        for i in range(self._scale.num_elements()):
+            self._scale.store[width=1](i, scale)
 
 
 @value
@@ -305,6 +331,9 @@ struct QuantizedTensorSlice:
 
     fn num_elements(self) -> Int:
         return self._shape.num_elements()
+
+    fn dim(self, idx: Int) -> Int:
+        return self._shape[idx]
 
 fn wrap(token: String) -> String:
     """Wrap special characters in the token.
@@ -696,11 +725,185 @@ struct TransformerWeights:
                 self.wcls = read_weights_i8(TensorShape(1, config.vocab_size, config.dim))
             print("wcls done, bytes read:", bytes_read)
             
+# From: llama2.mojo
+@register_passable
+struct Accumulator[T: DType, width: Int]:
+    # ideally this could be SIMD[T, width] but the width
+    # in accumulate() method is compared by identity
+    var data: DTypePointer[T]
+
+    @always_inline
+    fn __init__() -> Self:
+        # allocate a DTypePointer on stack that doesn't need to be freed.
+        var data = stack_allocation[width, T]()
+        memset_zero(data, width)
+        return Self {data: data}
+
+    @always_inline
+    fn accumulate[_width: Int](inout self, val: SIMD[T, _width]) -> None:
+        # This is a hack to make sure both SIMD have _width length.
+        # SIMD[T, width] += SIMD[T, _width] is always an error.
+        var newVal = self.data.load[width=_width]() + val
+        self.data.store[width=_width](newVal)
+
+    @always_inline
+    fn total(self) -> SIMD[T, 1]:
+        return self.data.load[width=width]().reduce_add()
+
+@always_inline
+fn rmsnorm(
+    inout o: DTypePointer[DType.float32],
+    x: DTypePointer[DType.float32],
+    weight: DTypePointer[DType.float32],
+    size: Int,
+) -> None:
+    # Calculate sum of squares
+    var tmp = Accumulator[DType.float32, nelts_f32]()
+
+    @parameter
+    fn _sum2[_nelts: Int](j: Int):
+        tmp.accumulate(x.offset(j).load[width=_nelts](0) ** 2)
+
+    vectorize[_sum2, nelts_f32](size)
+
+    var ss: Float32 = tmp.total()
+    ss = ss / size + 1e-5
+    ss = 1.0 / math.sqrt(ss)
+
+    # Normalize and scale
+    @parameter
+    fn _norm[_nelts: Int](j: Int):
+        var val = weight.load[width=_nelts](j) * ss * x.load[width=_nelts](j)
+        o.offset(j).store[width=_nelts](0, val)
+
+    vectorize[_norm, nelts_f32](size)
+
+
+@always_inline
+fn rmsnorm(inout o: Tensor[DType.float32], x: Tensor[DType.float32], weight: Tensor[DType.float32]):
+    rmsnorm(o._ptr, x.data(), weight.data(), weight.dim(weight.rank() - 1))
+
+
+@always_inline
+fn rmsnorm(inout o: Tensor[DType.float32], x: Tensor[DType.float32], weight: TensorSlice[DType.float32]):
+    rmsnorm(o._ptr, x.data(), weight.data(), weight.dim(weight.rank() - 1))
+
+@always_inline
+fn softmax(inout x: Tensor[DType.float32]) -> None:
+    softmax(x, 0, x.dim(0))
+
+
+@always_inline
+fn softmax(inout x: Tensor[DType.float32], start: Int, end: Int):
+    var max_val: Float32 = -1e9
+
+    @parameter
+    fn _max[_nelts: Int](ii: Int):
+        var val = x.load[width=_nelts](start + ii).reduce_max()
+        if val > max_val:
+            max_val = val
+
+    vectorize[_max, nelts_f32](end - start)
+
+    var acc = Accumulator[DType.float32, nelts_f32]()
+
+    @parameter
+    fn _exp[_nelts: Int](ii: Int):
+        var val = math.exp(x.load[width=_nelts](start + ii) - max_val)
+        x.store[width=_nelts](start + ii, val)
+        acc.accumulate(val)
+
+    vectorize[_exp, nelts_f32](end - start)
+
+    var ssum = acc.total()
+
+    @parameter
+    fn _norm[_nelts: Int](ii: Int):
+        x.store[width=_nelts](
+            start + ii, x.load[width=_nelts](start + ii) / ssum
+        )
+
+    vectorize[_norm, nelts_f32](end - start)
+
+@always_inline
+fn batch_matmul_fp32[
+    n: Int
+](
+    C: StaticTuple[DTypePointer[DType.float32], n],
+    A: DTypePointer[DType.float32],
+    B: StaticTuple[DTypePointer[DType.float32], n],
+    rows: Int,
+    cols: Int,
+):
+    @parameter
+    fn compute_row(i: Int):
+        var tmp = StaticTuple[Accumulator[DType.float32, nelts_f32], n]()
+
+        @unroll
+        for k in range(n):
+            tmp[k] = Accumulator[DType.float32, nelts_f32]()
+
+        var row_offset = i * cols
+
+        @parameter
+        fn dot[_nelts: Int](j: Int):
+            var a = A.load[width=_nelts](j)
+
+            @unroll
+            for k in range(n):
+                tmp[k].accumulate(a * B[k].load[width=_nelts](row_offset + j))
+
+        vectorize[dot, nelts_f32](cols)
+
+        @unroll
+        for k in range(n):
+            C[k].store(i, tmp[k].total())
+
+    parallelize[compute_row](rows, workers)
+
+@always_inline
+fn batch_matmul_i8[
+    n: Int
+](
+    C: StaticTuple[DTypePointer[DType.float32], n],
+    A: QuantizedTensor,
+    B: StaticTuple[UnsafePointer[QuantizedTensorSlice], n],
+    rows: Int,
+    cols: Int,
+):
+    # B (rows, cols) @ A (cols) = C (rows)
+    # print("A shape: ", A._quantized.shape(), A._scale.shape())
+    var group_size = A._group_size
+
+    @parameter
+    fn compute_row(i: Int):
+        var val = StaticTuple[Float32, n](0)
+        var offset = i * cols
+        for j in range(cols // group_size):
+            var ival = StaticTuple[Accumulator[DType.int32, nelts_q32], n]()
+            
+            @unroll
+            for k in range(n):
+                ival[k] = Accumulator[DType.int32, nelts_q32]()
+
+            @parameter
+            fn dot[_nelts: Int](k: Int):
+                @unroll
+                for idx in range(n):
+                    ival[idx].accumulate(A._quantized.load[width=_nelts](k + j * group_size).cast[DType.int32]()
+                        * B[idx][]._quantized.load[width=_nelts](k + offset + j * group_size).cast[DType.int32]())
+            
+            vectorize[dot, nelts_q32](group_size)
+
+            @unroll
+            for idx in range(n):
+                val[idx] += ival[idx].total().cast[DType.float32]() * A._scale.load[width=1](j) * B[idx][]._scale.load[width=1](offset // group_size + j)
         
-                    
-
-                    
-
+        @unroll
+        for idx in range(n):
+            C[idx].store(i, val[idx])
+        
+    parallelize[compute_row](rows, workers)
 
 
 def test():
@@ -804,10 +1007,66 @@ def test():
         var weights = TransformerWeights("llama3_8b_instruct_q80.bin", config)
         print("Transformer weights test passed")
     
+    def test_batch_matmul_i8():
+        alias dim = 4096
+        alias kv_dim = 1024
+        alias group_size = 64
+        alias n_layers = 32
+        var x_q = QuantizedTensor(TensorShape(dim), group_size)
+        x_q.fill(1, 0.1)
+
+        var wk = QuantizedTensor(TensorShape(n_layers, kv_dim, dim), group_size)
+        var wv = QuantizedTensor(TensorShape(n_layers, kv_dim, dim), group_size)
+        wk.fill(1, 0.1)
+        wv.fill(1, 0.1)
+
+        var layer = 0
+        var wk_slice = QuantizedTensorSlice(wk, layer)
+        var wv_slice = QuantizedTensorSlice(wv, layer)
+
+        var k = Tensor[DType.float32](TensorShape(kv_dim))
+        var v = Tensor[DType.float32](TensorShape(kv_dim))
+
+        batch_matmul_i8(
+            StaticTuple[DTypePointer[DType.float32], 2](k.data(), v.data()), 
+            x_q, 
+            StaticTuple[UnsafePointer[QuantizedTensorSlice], 2](
+                UnsafePointer(wk_slice), 
+                UnsafePointer(wv_slice)
+            ), 
+            kv_dim, 
+            dim)
+
+        print("Quantized batch matmul test")
+        print("x_q:", x_q._quantized.data()[0], " ", x_q._scale.data()[0])
+        print("wk:", wk._quantized.data()[0], " ", wk._scale.data()[0])
+        print("wv:", wv._quantized.data()[0], " ", wv._scale.data()[0])
+        print("k:", k.data()[0])
+        print("v:", v.data()[0])
+
+        if k.data()[0] - 40.96 > 1e-2:
+            print("Error: k.data()[0] != 64")
+            return
+        
+        if v.data()[0] - 40.96 > 1e-2:
+            print("Error: v.data()[0] != 64")
+            return
+
+        _ = x_q
+        _ = wk
+        _ = wv
+        _ = k
+        _ = v
+
+        print("Quantized batch matmul test passed")
+
+
     # test_quantized_tensor()
     # test_bpe_encode()
-    test_transformer_weights()
+    # test_transformer_weights()
+    test_batch_matmul_i8()
 
 def main():
+    workers = num_performance_cores()
     test()
     
