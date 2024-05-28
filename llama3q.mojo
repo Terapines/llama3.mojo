@@ -227,6 +227,85 @@ struct QuantizedTensor:
                 )
 
 
+@value
+struct QuantizedTensorSlice:
+    """A reference to a quantized tensor."""
+
+    var _quantized: DTypePointer[DType.int8]
+    var _scale: DTypePointer[DType.float32]
+    var _shape: TensorShape
+    var _group_size: Int
+
+    fn __init__(
+        inout self,
+        quantized: DTypePointer[DType.int8],
+        scale: DTypePointer[DType.float32],
+        shape: TensorShape,
+        group_size: Int,
+    ):
+        self._quantized = quantized
+        self._scale = scale
+        self._shape = shape
+        self._group_size = group_size
+
+    fn __init__(inout self, qt: QuantizedTensor, layer: Int) raises:
+        var num_layer_quantized_elements = qt._quantized.num_elements() / qt._quantized.dim(0)
+        var num_layer_scale_elements = qt._scale.num_elements() / qt._scale.dim(0)
+
+        self._quantized = qt._quantized.data().offset(layer * num_layer_quantized_elements)
+        self._scale = qt._scale.data().offset(layer * num_layer_scale_elements)
+
+        if qt._quantized.rank() == 2:
+            self._shape = TensorShape(qt._quantized.dim(1))
+        elif qt._quantized.rank() == 3:
+            self._shape = TensorShape(qt._quantized.dim(1), qt._quantized.dim(2))
+        else:
+            raise Error("unimplemented rank")
+
+        self._group_size = qt._group_size
+    
+    fn __init__(inout self, qt: QuantizedTensor, layer: Int, row: Int) raises:
+        var num_layer_quantized_elements = qt._quantized.num_elements() / qt._quantized.dim(0)
+        var num_layer_scale_elements = qt._scale.num_elements() / qt._scale.dim(0)
+        var num_row_quantized_elements = num_layer_quantized_elements / qt._quantized.dim(1)
+        var num_row_scale_elements = num_layer_scale_elements / qt._scale.dim(1)
+
+        self._quantized = qt._quantized.data().offset(
+            layer * num_layer_quantized_elements + row * num_row_quantized_elements
+        )
+        self._scale = qt._scale.data().offset(
+            layer * num_layer_scale_elements + row * num_row_scale_elements
+        )
+
+        if qt._quantized.rank() == 3:
+            self._shape = TensorShape(qt._quantized.dim(2))
+        else:
+            raise Error("unimplemented rank")
+
+        self._group_size = qt._group_size
+
+
+    fn __getitem__(self, idx: Int) -> SIMD[DType.int8, 1]:
+        return self._quantized.load[width=1](idx)
+
+    fn load[width: Int](self, idx: Int) -> SIMD[DType.int8, width]:
+        return self._quantized.load[width=width](idx)
+
+    fn store[width: Int](self, idx: Int, value: SIMD[DType.int8, width]):
+        self._quantized.store[width=width](idx, value)
+
+    fn quantized_data(self) -> DTypePointer[DType.int8]:
+        return self._quantized
+
+    fn scale_data(self) -> DTypePointer[DType.float32]:
+        return self._scale
+
+    fn shape(self) -> TensorShape:
+        return self._shape
+
+    fn num_elements(self) -> Int:
+        return self._shape.num_elements()
+
 fn wrap(token: String) -> String:
     """Wrap special characters in the token.
 
@@ -380,19 +459,19 @@ fn read_bytes_as[dtype: DType](inout f: FileHandle) raises -> SIMD[dtype, 1]:
 
 struct Config:
     """Configuration of the model."""
-    var version: Int32
-    var dim: Int32
-    var kv_dim: Int32
-    var hidden_dim: Int32
-    var n_layers: Int32
-    var n_heads: Int32
-    var n_kv_heads: Int32
-    var kv_mul: Int32
-    var vocab_size: Int32
-    var seq_len: Int32
-    var head_size: Int32
+    var version: Int
+    var dim: Int
+    var kv_dim: Int
+    var hidden_dim: Int
+    var n_layers: Int
+    var n_heads: Int
+    var n_kv_heads: Int
+    var kv_mul: Int
+    var vocab_size: Int
+    var seq_len: Int
+    var head_size: Int
     var shared_weights: Bool
-    var group_size: Int32
+    var group_size: Int
 
     fn __init__(inout self, fileName: String, print_config: Bool) raises:
         #  Header (256 bytes)
@@ -425,16 +504,16 @@ struct Config:
             var magic = read_bytes_as[DType.uint32](f)
             if magic != 0x616b3432:
                 raise Error("Invalid magic number")
-            self.version = read_bytes_as[DType.int32](f)
-            self.dim = read_bytes_as[DType.int32](f)
-            self.hidden_dim = read_bytes_as[DType.int32](f)
-            self.n_layers = read_bytes_as[DType.int32](f)
-            self.n_heads = read_bytes_as[DType.int32](f)
-            self.n_kv_heads = read_bytes_as[DType.int32](f)
-            self.vocab_size = read_bytes_as[DType.int32](f)
-            self.seq_len = read_bytes_as[DType.int32](f)
+            self.version = int(read_bytes_as[DType.int32](f))
+            self.dim = int(read_bytes_as[DType.int32](f))
+            self.hidden_dim = int(read_bytes_as[DType.int32](f))
+            self.n_layers = int(read_bytes_as[DType.int32](f))
+            self.n_heads = int(read_bytes_as[DType.int32](f))
+            self.n_kv_heads = int(read_bytes_as[DType.int32](f))
+            self.vocab_size = int(read_bytes_as[DType.int32](f))
+            self.seq_len = int(read_bytes_as[DType.int32](f))
             self.shared_weights = read_bytes_as[DType.uint8](f) == 1
-            self.group_size = read_bytes_as[DType.int32](f)
+            self.group_size = int(read_bytes_as[DType.int32](f))
             self.head_size = self.dim // self.n_heads
             self.kv_dim = (self.n_kv_heads * self.dim) // self.n_heads
             self.kv_mul = self.n_heads // self.n_kv_heads
@@ -492,6 +571,132 @@ struct RunState:
             int(config.group_size)
         )
 
+@value
+struct TransformerWeights:
+    var token_embedding_table: Tensor[DType.float32]
+    var q_token_embedding_table: QuantizedTensor
+
+    var rms_att_weight: Tensor[DType.float32]
+    var rms_ffn_weight: Tensor[DType.float32]
+
+    # var freq_cis_real: TensorF32
+    # var freq_cis_imag: TensorF32
+    
+    var wq: QuantizedTensor
+    var wk: QuantizedTensor
+    var wv: QuantizedTensor
+    var wo: QuantizedTensor
+
+    var w1: QuantizedTensor
+    var w2: QuantizedTensor
+    var w3: QuantizedTensor
+
+    var rms_final_weight: Tensor[DType.float32]
+    var wcls: QuantizedTensor
+
+    fn __init__(inout self, file_name: String, config: Config) raises:
+        var bytes_read = 0
+        with open(file_name, "rb") as f:
+            
+            @parameter
+            fn read_weights_fp32(shape: TensorShape) raises -> Tensor[DType.float32]:
+                var bytes = f.read_bytes(shape.num_elements() * sizeof[DType.float32]())
+                bytes_read += bytes.size
+                var data = bytes.steal_data().bitcast[Float32]()
+                
+                return Tensor[DType.float32](shape, data)
+            
+            @parameter
+            fn read_weights_i8(shape: TensorShape) raises -> QuantizedTensor:
+                """Read quantized weights from the file.
+                
+                Args:
+                    shape: The shape of the weights, should be (layer, dim, ...)
+                """
+                if shape.rank() <= 1:
+                    raise Error("invalid shape for quantized weights, should be (layer, dim, ...)")
+
+                var tensor = QuantizedTensor(shape, config.group_size)
+
+                var n_layers = shape[0]
+                for i in range(n_layers):
+                    var tensor_layer = QuantizedTensorSlice(tensor, i)
+
+                    # read int8 weights
+                    var weight_bytes = f.read_bytes(shape.num_elements() // n_layers * sizeof[DType.int8]())
+                    var weight_size = weight_bytes.size
+                    bytes_read += weight_size
+                    var weight_data = weight_bytes.steal_data()
+                    
+                    # read scale factors
+                    var scale_bytes = f.read_bytes(shape.num_elements() // n_layers // config.group_size * sizeof[DType.float32]())
+                    var scale_size = scale_bytes.size
+                    bytes_read += scale_size
+                    var scale_data = scale_bytes.steal_data().bitcast[Float32]()
+
+                    memcpy(tensor_layer.quantized_data(), weight_data, weight_size)
+                    memcpy(tensor_layer.scale_data(), scale_data, scale_size // sizeof[DType.float32]())
+
+                    # not sure if we need to free the data here
+                    weight_data.free()
+                    scale_data.free()
+                
+                return tensor
+            
+            # 256 bytes for the config header
+            var config_header_bytes = f.read_bytes(NUM_CONFIG_HEADER_BYTES)
+            bytes_read += config_header_bytes.size
+            print("header done, bytes read:", bytes_read)
+
+            # rms_att_weight
+            self.rms_att_weight = read_weights_fp32(TensorShape(config.n_layers, config.dim))
+            print("rms_att_weight done, bytes read:", bytes_read)
+
+            # rms_ffn_weight
+            self.rms_ffn_weight = read_weights_fp32(TensorShape(config.n_layers, config.dim))
+            print("rms_ffn_weight done, bytes read:", bytes_read)
+
+            # rms_final_weight
+            self.rms_final_weight = read_weights_fp32(TensorShape(config.n_layers, config.dim))
+            print("rms_final_weight done, bytes read:", bytes_read)
+
+            # q_token_embedding_table
+            self.q_token_embedding_table = read_weights_i8(TensorShape(1, config.vocab_size, config.dim)) # expand layer dim = 1
+            print("q_token_embedding_table done, bytes read:", bytes_read)
+
+            # dequantize token_embedding_table
+            self.token_embedding_table = Tensor[DType.float32](TensorShape(1, config.vocab_size, config.dim))
+            print("token_embedding_table done, bytes read:", bytes_read)
+            self.q_token_embedding_table.dequantize(TensorSlice(self.token_embedding_table, 0))
+            print("dequantize token_embedding_table done, bytes read:", bytes_read)
+
+            # wq, wk, wv, wo
+            self.wq = read_weights_i8(TensorShape(config.n_layers, config.dim, config.dim))
+            self.wk = read_weights_i8(TensorShape(config.n_layers, config.kv_dim, config.dim))
+            self.wv = read_weights_i8(TensorShape(config.n_layers, config.kv_dim, config.dim))
+            self.wo = read_weights_i8(TensorShape(config.n_layers, config.dim, config.kv_dim))
+            print("wq, wk, wv, wo done, bytes read:", bytes_read)
+
+            # w1, w2, w3
+            self.w1 = read_weights_i8(TensorShape(config.n_layers, config.hidden_dim, config.dim))
+            self.w2 = read_weights_i8(TensorShape(config.n_layers, config.dim, config.hidden_dim))
+            self.w3 = read_weights_i8(TensorShape(config.n_layers, config.hidden_dim, config.dim))
+            print("w1, w2, w3 done, bytes read:", bytes_read)
+
+            # wcls
+            if config.shared_weights:
+                self.wcls = self.wq
+            else:
+                self.wcls = read_weights_i8(TensorShape(1, config.vocab_size, config.dim))
+            print("wcls done, bytes read:", bytes_read)
+            
+        
+                    
+
+                    
+
+
+
 def test():
     def test_quantized_tensor():
         alias N = 4096
@@ -499,11 +704,11 @@ def test():
         print("QuantizedTensor test")
         var qt = QuantizedTensor(
             TensorShape(N),
-            int(group_size)
+            group_size
         )
         var qt_naive = QuantizedTensor(
             TensorShape(N),
-            int(group_size)
+            group_size
         )
 
         var x = rand[DType.float32](5, N) - 0.5
@@ -585,9 +790,17 @@ def test():
                 print("Got: ", prompt_tokens[i])
         
         print("BPE encode test passed")
+
     
-    test_quantized_tensor()
-    test_bpe_encode()
+    def test_transformer_weights():
+        print("Transformer weights test")
+        var config = Config("llama3_8b_instruct_q80.bin", True)
+        var weights = TransformerWeights("llama3_8b_instruct_q80.bin", config)
+        print("Transformer weights test passed")
+    
+    # test_quantized_tensor()
+    # test_bpe_encode()
+    test_transformer_weights()
 
 def main():
     test()
