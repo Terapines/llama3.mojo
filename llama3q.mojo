@@ -69,12 +69,13 @@ struct TensorSlice[type: DType]:
 
     fn num_elements(self) -> Int:
         return self._shape.num_elements()
-    
+
     fn dim(self, idx: Int) -> Int:
         return self._shape[idx]
 
     fn rank(self) -> Int:
         return self._shape.rank()
+
 
 @value
 struct QuantizedTensor:
@@ -134,9 +135,10 @@ struct QuantizedTensor:
             var group = i // self._group_size
             var scale_factor = self._scale[group]
 
-            var quantized_lane = self._quantized.load[width=1](i).cast[DType.float32]()
+            var quantized_lane = self._quantized.load[width=1](i).cast[
+                DType.float32
+            ]()
             dequantized.store[width=1](i, quantized_lane * scale_factor)
-
 
     fn quantize(inout self, dequantized: TensorSlice[DType.float32]) raises:
         """Quantize the `dequantized` and update self.
@@ -146,7 +148,12 @@ struct QuantizedTensor:
         """
 
         if dequantized.shape() != self._quantized.shape():
-            raise Error("shape mismatch, expected: " + str(self._quantized.shape()) + ", got: " + str(dequantized.shape()))
+            raise Error(
+                "shape mismatch, expected: "
+                + str(self._quantized.shape())
+                + ", got: "
+                + str(dequantized.shape())
+            )
 
         var num_elements = dequantized.num_elements()
 
@@ -189,13 +196,15 @@ struct QuantizedTensor:
                 )
 
             vectorize[_quantize, nelts_f32](self._group_size)
-        
+
         parallelize[quantize_group](num_groups, num_groups)
-    
+
     fn rank(self) -> Int:
         return self._quantized.rank()
-    
-    fn quantize_naive(inout self, dequantized: TensorSlice[DType.float32]) raises:
+
+    fn quantize_naive(
+        inout self, dequantized: TensorSlice[DType.float32]
+    ) raises:
         """Quantize the `dequantized` and update self. Uses a naive implementation.
 
         Args:
@@ -203,7 +212,12 @@ struct QuantizedTensor:
         """
 
         if dequantized.shape() != self._quantized.shape():
-            raise Error("shape mismatch, expected: " + str(self._quantized.shape()) + ", got: " + str(dequantized.shape()))
+            raise Error(
+                "shape mismatch, expected: "
+                + str(self._quantized.shape())
+                + ", got: "
+                + str(dequantized.shape())
+            )
 
         var num_elements = dequantized.num_elements()
 
@@ -233,11 +247,13 @@ struct QuantizedTensor:
                 var dequantized_lane = dequantized.load[width=1](
                     group * self._group_size + i
                 )
-                var quantized_lane = round(dequantized_lane / scale_factor).cast[DType.int8]()
+                var quantized_lane = round(
+                    dequantized_lane / scale_factor
+                ).cast[DType.int8]()
                 self._quantized.store[width=1](
                     group * self._group_size + i, quantized_lane
                 )
-        
+
     fn fill(inout self, quantized: Int8, scale: Float32):
         """Fill the tensor with a constant value.
 
@@ -248,7 +264,7 @@ struct QuantizedTensor:
 
         for i in range(self._quantized.num_elements()):
             self._quantized.store[width=1](i, quantized)
-        
+
         for i in range(self._scale.num_elements()):
             self._scale.store[width=1](i, scale)
 
@@ -275,29 +291,44 @@ struct QuantizedTensorSlice:
         self._group_size = group_size
 
     fn __init__(inout self, qt: QuantizedTensor, layer: Int) raises:
-        var num_layer_quantized_elements = qt._quantized.num_elements() / qt._quantized.dim(0)
-        var num_layer_scale_elements = qt._scale.num_elements() / qt._scale.dim(0)
+        var num_layer_quantized_elements = qt._quantized.num_elements() / qt._quantized.dim(
+            0
+        )
+        var num_layer_scale_elements = qt._scale.num_elements() / qt._scale.dim(
+            0
+        )
 
-        self._quantized = qt._quantized.data().offset(layer * num_layer_quantized_elements)
+        self._quantized = qt._quantized.data().offset(
+            layer * num_layer_quantized_elements
+        )
         self._scale = qt._scale.data().offset(layer * num_layer_scale_elements)
 
         if qt._quantized.rank() == 2:
             self._shape = TensorShape(qt._quantized.dim(1))
         elif qt._quantized.rank() == 3:
-            self._shape = TensorShape(qt._quantized.dim(1), qt._quantized.dim(2))
+            self._shape = TensorShape(
+                qt._quantized.dim(1), qt._quantized.dim(2)
+            )
         else:
             raise Error("unimplemented rank")
 
         self._group_size = qt._group_size
-    
+
     fn __init__(inout self, qt: QuantizedTensor, layer: Int, row: Int) raises:
-        var num_layer_quantized_elements = qt._quantized.num_elements() / qt._quantized.dim(0)
-        var num_layer_scale_elements = qt._scale.num_elements() / qt._scale.dim(0)
-        var num_row_quantized_elements = num_layer_quantized_elements / qt._quantized.dim(1)
+        var num_layer_quantized_elements = qt._quantized.num_elements() / qt._quantized.dim(
+            0
+        )
+        var num_layer_scale_elements = qt._scale.num_elements() / qt._scale.dim(
+            0
+        )
+        var num_row_quantized_elements = num_layer_quantized_elements / qt._quantized.dim(
+            1
+        )
         var num_row_scale_elements = num_layer_scale_elements / qt._scale.dim(1)
 
         self._quantized = qt._quantized.data().offset(
-            layer * num_layer_quantized_elements + row * num_row_quantized_elements
+            layer * num_layer_quantized_elements
+            + row * num_row_quantized_elements
         )
         self._scale = qt._scale.data().offset(
             layer * num_layer_scale_elements + row * num_row_scale_elements
@@ -309,7 +340,6 @@ struct QuantizedTensorSlice:
             raise Error("unimplemented rank")
 
         self._group_size = qt._group_size
-
 
     fn __getitem__(self, idx: Int) -> SIMD[DType.int8, 1]:
         return self._quantized.load[width=1](idx)
@@ -334,6 +364,7 @@ struct QuantizedTensorSlice:
 
     fn dim(self, idx: Int) -> Int:
         return self._shape[idx]
+
 
 fn wrap(token: String) -> String:
     """Wrap special characters in the token.
@@ -370,6 +401,7 @@ fn string_from_bytes(owned bytes: List[Int8]) -> String:
 @value
 struct Tokenizer:
     """A Byte Pair Encoding (BPE) tokenizer."""
+
     var vocab: List[String]
     var vocab_scores: List[Float32]
     var max_token_length: Int
@@ -400,7 +432,6 @@ struct Tokenizer:
             for i in range(self.vocab_size):
                 var score = read_bytes_as[DType.float32](4)
                 var slen = int(read_bytes_as[DType.int32](4))
-
 
                 var token = string_from_bytes(f.read_bytes(slen))
                 self.vocab.append(token^)
@@ -486,8 +517,10 @@ fn read_bytes_as[dtype: DType](inout f: FileHandle) raises -> SIMD[dtype, 1]:
     _ = bytes
     return result
 
+
 struct Config:
     """Configuration of the model."""
+
     var version: Int
     var dim: Int
     var kv_dim: Int
@@ -517,13 +550,13 @@ struct Config:
         #  1 byte:   Shared classifier flag                   // uint8
         #  4 bytes:  Group size for quantization              // int32
         #  Remaining: Zero padding to 256 bytes               // uint8[]
-        #  
+        #
         #  FP32 Norm Parameters
         #  --------------------
         #  Attention norm weights (each layer)                // float32[]
         #  Feed-forward norm weights (each layer)             // float32[]
         #  Final norm weight before classifier                // float32[]
-        #  
+        #
         #  Quantized Weights (Q8_0)
         #  ------------------------
         #  For each weight matrix:
@@ -531,7 +564,7 @@ struct Config:
         #  - Scale factors (FP32)                             // float32[]
         with open(fileName, "rb") as f:
             var magic = read_bytes_as[DType.uint32](f)
-            if magic != 0x616b3432:
+            if magic != 0x616B3432:
                 raise Error("Invalid magic number")
             self.version = int(read_bytes_as[DType.int32](f))
             self.dim = int(read_bytes_as[DType.int32](f))
@@ -553,24 +586,37 @@ struct Config:
             print("config: vocab_size, seq_len", self.vocab_size, self.seq_len)
             print("config: head_size", self.head_size)
             print("config: kv_dim, kv_mul", self.kv_dim, self.kv_mul)
-            print("config: shared_weights, group_size", self.shared_weights, self.group_size)
+            print(
+                "config: shared_weights, group_size",
+                self.shared_weights,
+                self.group_size,
+            )
+
 
 @value
 struct RunState:
     var x: Tensor[DType.float32]  # activation at current time stamp (dim,)
     var xb: Tensor[DType.float32]  # same, but inside a residual branch (dim,)
-    var xb2: Tensor[DType.float32]  # an additional buffer just for convenience (dim,)
-    var hb: Tensor[DType.float32]  # buffer for hidden dimension in the ffn (hidden_dim,)
-    var hb2: Tensor[DType.float32]  # buffer for hidden dimension in the ffn (hidden_dim,)
+    var xb2: Tensor[
+        DType.float32
+    ]  # an additional buffer just for convenience (dim,)
+    var hb: Tensor[
+        DType.float32
+    ]  # buffer for hidden dimension in the ffn (hidden_dim,)
+    var hb2: Tensor[
+        DType.float32
+    ]  # buffer for hidden dimension in the ffn (hidden_dim,)
     var q: Tensor[DType.float32]  # query (dim,)
     var k: TensorSlice[DType.float32]  # key (kv_dim,)
     var v: TensorSlice[DType.float32]  # value (kv_dim,)
-    var att: Tensor[DType.float32]  # buffer for scores/attention values (n_heads, seq_len)
+    var att: Tensor[
+        DType.float32
+    ]  # buffer for scores/attention values (n_heads, seq_len)
     var logits: Tensor[DType.float32]  # output logits
     var key_cache: Tensor[DType.float32]  # (layer, seq_len, dim)
     var value_cache: Tensor[DType.float32]  # (layer, seq_len, dim)
-    var x_q: QuantizedTensor # quantized x (dim,)
-    var hb_q: QuantizedTensor # quantized hb (hidden_dim,)
+    var x_q: QuantizedTensor  # quantized x (dim,)
+    var hb_q: QuantizedTensor  # quantized hb (hidden_dim,)
 
     fn __init__(inout self, config: Config) raises:
         self.x = Tensor[DType.float32](config.dim)
@@ -579,26 +625,31 @@ struct RunState:
         self.hb = Tensor[DType.float32](config.hidden_dim)
         self.hb2 = Tensor[DType.float32](config.hidden_dim)
         self.q = Tensor[DType.float32](config.dim)
-        self.att = Tensor[DType.float32](TensorShape((config.n_heads, config.seq_len)))
+        self.att = Tensor[DType.float32](
+            TensorShape((config.n_heads, config.seq_len))
+        )
         self.logits = Tensor[DType.float32](config.vocab_size)
-        self.key_cache = Tensor[DType.float32](TensorShape((
-            config.n_layers, config.seq_len, config.kv_dim
-        )))
-        self.value_cache = Tensor[DType.float32](TensorShape((
-            config.n_layers, config.seq_len, config.kv_dim
-        )))
+        self.key_cache = Tensor[DType.float32](
+            TensorShape((config.n_layers, config.seq_len, config.kv_dim))
+        )
+        self.value_cache = Tensor[DType.float32](
+            TensorShape((config.n_layers, config.seq_len, config.kv_dim))
+        )
         # So their updates flow to the caches, k and v are slices with shared memory.
         # Initialize with placeholders. The real tensors reference layer and position during forward pass.
-        self.k = TensorSlice(Tensor[DType.float32](TensorShape((1, config.kv_dim))), 1)
-        self.v = TensorSlice(Tensor[DType.float32](TensorShape((1, config.kv_dim))), 1)
+        self.k = TensorSlice(
+            Tensor[DType.float32](TensorShape((1, config.kv_dim))), 1
+        )
+        self.v = TensorSlice(
+            Tensor[DType.float32](TensorShape((1, config.kv_dim))), 1
+        )
         self.x_q = QuantizedTensor(
-            TensorShape(config.dim),
-            int(config.group_size)
+            TensorShape(config.dim), int(config.group_size)
         )
         self.hb_q = QuantizedTensor(
-            TensorShape(config.hidden_dim),
-            int(config.group_size)
+            TensorShape(config.hidden_dim), int(config.group_size)
         )
+
 
 @value
 struct TransformerWeights:
@@ -610,7 +661,7 @@ struct TransformerWeights:
 
     # var freq_cis_real: TensorF32
     # var freq_cis_imag: TensorF32
-    
+
     var wq: QuantizedTensor
     var wk: QuantizedTensor
     var wv: QuantizedTensor
@@ -626,26 +677,33 @@ struct TransformerWeights:
     fn __init__(inout self, file_name: String, config: Config) raises:
         var bytes_read = 0
         with open(file_name, "rb") as f:
-            
+
             @parameter
-            fn read_weights_fp32(shape: TensorShape) raises -> Tensor[DType.float32]:
-                var bytes = f.read_bytes(shape.num_elements() * sizeof[DType.float32]())
+            fn read_weights_fp32(
+                shape: TensorShape,
+            ) raises -> Tensor[DType.float32]:
+                var bytes = f.read_bytes(
+                    shape.num_elements() * sizeof[DType.float32]()
+                )
                 if bytes.size != shape.num_elements() * sizeof[DType.float32]():
                     raise Error("EOF while reading weights")
                 bytes_read += bytes.size
                 var data = bytes.steal_data().bitcast[Float32]()
-                
+
                 return Tensor[DType.float32](shape, data)
-            
+
             @parameter
             fn read_weights_i8(shape: TensorShape) raises -> QuantizedTensor:
                 """Read quantized weights from the file.
-                
+
                 Args:
                     shape: The shape of the weights, should be (layer, dim, ...)
                 """
                 if shape.rank() <= 1:
-                    raise Error("invalid shape for quantized weights, should be (layer, dim, ...)")
+                    raise Error(
+                        "invalid shape for quantized weights, should be (layer,"
+                        " dim, ...)"
+                    )
 
                 var tensor = QuantizedTensor(shape, config.group_size)
 
@@ -654,41 +712,69 @@ struct TransformerWeights:
                     var tensor_layer = QuantizedTensorSlice(tensor, i)
 
                     # read int8 weights
-                    var weight_bytes = f.read_bytes(shape.num_elements() // n_layers * sizeof[DType.int8]())
-                    if weight_bytes.size != shape.num_elements() // n_layers * sizeof[DType.int8]():
+                    var weight_bytes = f.read_bytes(
+                        shape.num_elements() // n_layers * sizeof[DType.int8]()
+                    )
+                    if (
+                        weight_bytes.size
+                        != shape.num_elements()
+                        // n_layers
+                        * sizeof[DType.int8]()
+                    ):
                         raise Error("EOF while reading weights")
                     var weight_size = weight_bytes.size
                     bytes_read += weight_size
                     var weight_data = weight_bytes.steal_data()
-                    
+
                     # read scale factors
-                    var scale_bytes = f.read_bytes(shape.num_elements() // n_layers // config.group_size * sizeof[DType.float32]())
-                    if scale_bytes.size != shape.num_elements() // n_layers // config.group_size * sizeof[DType.float32]():
+                    var scale_bytes = f.read_bytes(
+                        shape.num_elements()
+                        // n_layers
+                        // config.group_size
+                        * sizeof[DType.float32]()
+                    )
+                    if (
+                        scale_bytes.size
+                        != shape.num_elements()
+                        // n_layers
+                        // config.group_size
+                        * sizeof[DType.float32]()
+                    ):
                         raise Error("EOF while reading scale factors")
                     var scale_size = scale_bytes.size
                     bytes_read += scale_size
                     var scale_data = scale_bytes.steal_data().bitcast[Float32]()
 
-                    memcpy(tensor_layer.quantized_data(), weight_data, weight_size)
-                    memcpy(tensor_layer.scale_data(), scale_data, scale_size // sizeof[DType.float32]())
+                    memcpy(
+                        tensor_layer.quantized_data(), weight_data, weight_size
+                    )
+                    memcpy(
+                        tensor_layer.scale_data(),
+                        scale_data,
+                        scale_size // sizeof[DType.float32](),
+                    )
 
                     # not sure if we need to free the data here
                     weight_data.free()
                     scale_data.free()
-                
+
                 return tensor
-            
+
             # 256 bytes for the config header
             var config_header_bytes = f.read_bytes(NUM_CONFIG_HEADER_BYTES)
             bytes_read += config_header_bytes.size
             print("header done, bytes read:", bytes_read)
 
             # rms_att_weight
-            self.rms_att_weight = read_weights_fp32(TensorShape(config.n_layers, config.dim))
+            self.rms_att_weight = read_weights_fp32(
+                TensorShape(config.n_layers, config.dim)
+            )
             print("rms_att_weight done, bytes read:", bytes_read)
 
             # rms_ffn_weight
-            self.rms_ffn_weight = read_weights_fp32(TensorShape(config.n_layers, config.dim))
+            self.rms_ffn_weight = read_weights_fp32(
+                TensorShape(config.n_layers, config.dim)
+            )
             print("rms_ffn_weight done, bytes read:", bytes_read)
 
             # rms_final_weight
@@ -696,35 +782,63 @@ struct TransformerWeights:
             print("rms_final_weight done, bytes read:", bytes_read)
 
             # q_token_embedding_table
-            self.q_token_embedding_table = read_weights_i8(TensorShape(1, config.vocab_size, config.dim)) # expand layer dim = 1
+            self.q_token_embedding_table = read_weights_i8(
+                TensorShape(1, config.vocab_size, config.dim)
+            )  # expand layer dim = 1
             print("q_token_embedding_table done, bytes read:", bytes_read)
 
             # dequantize token_embedding_table
-            self.token_embedding_table = Tensor[DType.float32](TensorShape(config.vocab_size, config.dim))
+            self.token_embedding_table = Tensor[DType.float32](
+                TensorShape(config.vocab_size, config.dim)
+            )
             print("token_embedding_table done, bytes read:", bytes_read)
-            self.q_token_embedding_table.dequantize(TensorSlice(self.token_embedding_table.data(), TensorShape(config.vocab_size, config.dim)))
-            print("dequantize token_embedding_table done, bytes read:", bytes_read)
+            self.q_token_embedding_table.dequantize(
+                TensorSlice(
+                    self.token_embedding_table.data(),
+                    TensorShape(config.vocab_size, config.dim),
+                )
+            )
+            print(
+                "dequantize token_embedding_table done, bytes read:", bytes_read
+            )
 
             # wq, wk, wv, wo
-            self.wq = read_weights_i8(TensorShape(config.n_layers, config.dim, config.dim))
-            self.wk = read_weights_i8(TensorShape(config.n_layers, config.kv_dim, config.dim))
-            self.wv = read_weights_i8(TensorShape(config.n_layers, config.kv_dim, config.dim))
-            self.wo = read_weights_i8(TensorShape(config.n_layers, config.dim, config.dim))
+            self.wq = read_weights_i8(
+                TensorShape(config.n_layers, config.dim, config.dim)
+            )
+            self.wk = read_weights_i8(
+                TensorShape(config.n_layers, config.kv_dim, config.dim)
+            )
+            self.wv = read_weights_i8(
+                TensorShape(config.n_layers, config.kv_dim, config.dim)
+            )
+            self.wo = read_weights_i8(
+                TensorShape(config.n_layers, config.dim, config.dim)
+            )
             print("wq, wk, wv, wo done, bytes read:", bytes_read)
 
             # w1, w2, w3
-            self.w1 = read_weights_i8(TensorShape(config.n_layers, config.hidden_dim, config.dim))
-            self.w2 = read_weights_i8(TensorShape(config.n_layers, config.dim, config.hidden_dim))
-            self.w3 = read_weights_i8(TensorShape(config.n_layers, config.hidden_dim, config.dim))
+            self.w1 = read_weights_i8(
+                TensorShape(config.n_layers, config.hidden_dim, config.dim)
+            )
+            self.w2 = read_weights_i8(
+                TensorShape(config.n_layers, config.dim, config.hidden_dim)
+            )
+            self.w3 = read_weights_i8(
+                TensorShape(config.n_layers, config.hidden_dim, config.dim)
+            )
             print("w1, w2, w3 done, bytes read:", bytes_read)
 
             # wcls
             if config.shared_weights:
                 self.wcls = self.wq
             else:
-                self.wcls = read_weights_i8(TensorShape(1, config.vocab_size, config.dim))
+                self.wcls = read_weights_i8(
+                    TensorShape(1, config.vocab_size, config.dim)
+                )
             print("wcls done, bytes read:", bytes_read)
-            
+
+
 # From: llama2.mojo
 @register_passable
 struct Accumulator[T: DType, width: Int]:
@@ -749,6 +863,7 @@ struct Accumulator[T: DType, width: Int]:
     @always_inline
     fn total(self) -> SIMD[T, 1]:
         return self.data.load[width=width]().reduce_add()
+
 
 @always_inline
 fn rmsnorm(
@@ -780,13 +895,22 @@ fn rmsnorm(
 
 
 @always_inline
-fn rmsnorm(inout o: Tensor[DType.float32], x: Tensor[DType.float32], weight: Tensor[DType.float32]):
+fn rmsnorm(
+    inout o: Tensor[DType.float32],
+    x: Tensor[DType.float32],
+    weight: Tensor[DType.float32],
+):
     rmsnorm(o._ptr, x.data(), weight.data(), weight.dim(weight.rank() - 1))
 
 
 @always_inline
-fn rmsnorm(inout o: Tensor[DType.float32], x: Tensor[DType.float32], weight: TensorSlice[DType.float32]):
+fn rmsnorm(
+    inout o: Tensor[DType.float32],
+    x: Tensor[DType.float32],
+    weight: TensorSlice[DType.float32],
+):
     rmsnorm(o._ptr, x.data(), weight.data(), weight.dim(weight.rank() - 1))
+
 
 @always_inline
 fn softmax(inout x: Tensor[DType.float32]) -> None:
@@ -825,6 +949,7 @@ fn softmax(x: DTypePointer[DType.float32], start: Int, end: Int):
 
     vectorize[_norm, nelts_f32](end - start)
 
+
 @always_inline
 fn batch_matmul_fp32[
     n: Int
@@ -861,6 +986,7 @@ fn batch_matmul_fp32[
 
     parallelize[compute_row](rows, workers)
 
+
 @always_inline
 fn batch_matmul_i8[
     n: Int
@@ -881,7 +1007,7 @@ fn batch_matmul_i8[
         var offset = i * cols
         for j in range(cols // group_size):
             var ival = StaticTuple[Accumulator[DType.int32, nelts_q32], n]()
-            
+
             @unroll
             for k in range(n):
                 ival[k] = Accumulator[DType.int32, nelts_q32]()
@@ -890,19 +1016,31 @@ fn batch_matmul_i8[
             fn dot[_nelts: Int](k: Int):
                 @unroll
                 for idx in range(n):
-                    ival[idx].accumulate(A._quantized.load[width=_nelts](k + j * group_size).cast[DType.int32]()
-                        * B[idx][]._quantized.load[width=_nelts](k + offset + j * group_size).cast[DType.int32]())
-            
+                    ival[idx].accumulate(
+                        A._quantized.load[width=_nelts](
+                            k + j * group_size
+                        ).cast[DType.int32]()
+                        * B[idx][]
+                        ._quantized.load[width=_nelts](
+                            k + offset + j * group_size
+                        )
+                        .cast[DType.int32]()
+                    )
+
             vectorize[dot, nelts_q32](group_size)
 
             @unroll
             for idx in range(n):
-                val[idx] += ival[idx].total().cast[DType.float32]() * A._scale.load[width=1](j) * B[idx][]._scale.load[width=1](offset // group_size + j)
-        
+                val[idx] += (
+                    ival[idx].total().cast[DType.float32]()
+                    * A._scale.load[width=1](j)
+                    * B[idx][]._scale.load[width=1](offset // group_size + j)
+                )
+
         @unroll
         for idx in range(n):
             C[idx].store(i, val[idx])
-        
+
     parallelize[compute_row](rows, workers)
 
 
@@ -914,10 +1052,13 @@ fn matmul(
     batch_matmul_i8[1](
         StaticTuple[DTypePointer[DType.float32], 1](C.data()),
         A,
-        StaticTuple[UnsafePointer[QuantizedTensorSlice], 1](UnsafePointer[QuantizedTensorSlice](B)),
+        StaticTuple[UnsafePointer[QuantizedTensorSlice], 1](
+            UnsafePointer[QuantizedTensorSlice](B)
+        ),
         B.dim(0),
         B.dim(1),
     )
+
 
 fn matmul(
     C: TensorSlice[DType.float32],
@@ -927,10 +1068,13 @@ fn matmul(
     batch_matmul_i8[1](
         StaticTuple[DTypePointer[DType.float32], 1](C.data()),
         A,
-        StaticTuple[UnsafePointer[QuantizedTensorSlice], 1](UnsafePointer[QuantizedTensorSlice](B)),
+        StaticTuple[UnsafePointer[QuantizedTensorSlice], 1](
+            UnsafePointer[QuantizedTensorSlice](B)
+        ),
         B.dim(0),
         B.dim(1),
     )
+
 
 struct Transformer:
     var config: Config
@@ -943,28 +1087,42 @@ struct Transformer:
         self.state = RunState(self.config)
 
     fn forward(inout self, token: Int32, pos: Int) raises:
-
         var dim = self.config.dim
 
         memcpy(
             self.state.x.data(),
-            self.weights.token_embedding_table.data().offset(token * self.config.dim),
-            dim # not bytes
+            self.weights.token_embedding_table.data().offset(
+                token * self.config.dim
+            ),
+            dim,  # not bytes
         )
 
         for l in range(self.config.n_layers):
-
             rmsnorm(
                 self.state.xb.data(),
                 self.state.x.data(),
                 self.weights.rms_att_weight.data().offset(l * dim),
-                dim
+                dim,
             )
-            self.state.x_q.quantize(TensorSlice[DType.float32](self.state.xb, 0))
-            
-            matmul(self.state.q, self.state.x_q, QuantizedTensorSlice(self.weights.wq, l));
-            matmul(self.state.k, self.state.x_q, QuantizedTensorSlice(self.weights.wk, l));
-            matmul(self.state.v, self.state.x_q, QuantizedTensorSlice(self.weights.wv, l));
+            self.state.x_q.quantize(
+                TensorSlice[DType.float32](self.state.xb, 0)
+            )
+
+            matmul(
+                self.state.q,
+                self.state.x_q,
+                QuantizedTensorSlice(self.weights.wq, l),
+            )
+            matmul(
+                self.state.k,
+                self.state.x_q,
+                QuantizedTensorSlice(self.weights.wk, l),
+            )
+            matmul(
+                self.state.v,
+                self.state.x_q,
+                QuantizedTensorSlice(self.weights.wv, l),
+            )
 
             # TODO: accelerate RoPE
             for i in range(self.config.n_heads):
@@ -974,22 +1132,43 @@ struct Transformer:
                     var fcr = cos(val)
                     var fci = sin(val)
 
-                    var q0 = self.state.q.load[width=1](i * self.config.head_size + j)
-                    var k0 = self.state.k.load[width=1](i * self.config.head_size + j)
+                    var q0 = self.state.q.load[width=1](
+                        i * self.config.head_size + j
+                    )
+                    var k0 = self.state.k.load[width=1](
+                        i * self.config.head_size + j
+                    )
 
-                    self.state.q.store[width=1](i * self.config.head_size + j, q0 * fcr - k0 * fci)
-                    self.state.k.store[width=1](i * self.config.head_size + j + 1, q0 * fci + k0 * fcr)
+                    self.state.q.store[width=1](
+                        i * self.config.head_size + j, q0 * fcr - k0 * fci
+                    )
+                    self.state.k.store[width=1](
+                        i * self.config.head_size + j + 1, q0 * fci + k0 * fcr
+                    )
                     if i < self.config.n_kv_heads:
-                        var k0 = self.state.k.load[width=1](i * self.config.head_size + j)
-                        var k1 = self.state.k.load[width=1](i * self.config.head_size + j + 1)
+                        var k0 = self.state.k.load[width=1](
+                            i * self.config.head_size + j
+                        )
+                        var k1 = self.state.k.load[width=1](
+                            i * self.config.head_size + j + 1
+                        )
 
-                        self.state.k.store[width=1](i * self.config.head_size + j, k0 * fcr - k1 * fci)
-                        self.state.k.store[width=1](i * self.config.head_size + j + 1, k0 * fci + k1 * fcr)
+                        self.state.k.store[width=1](
+                            i * self.config.head_size + j, k0 * fcr - k1 * fci
+                        )
+                        self.state.k.store[width=1](
+                            i * self.config.head_size + j + 1,
+                            k0 * fci + k1 * fcr,
+                        )
 
             # kv cache
             var loff = l * self.config.seq_len * self.config.kv_dim
-            var k_cache_row = self.state.key_cache.data().offset(loff + pos * self.config.kv_dim)
-            var v_cache_row = self.state.value_cache.data().offset(loff + pos * self.config.kv_dim)
+            var k_cache_row = self.state.key_cache.data().offset(
+                loff + pos * self.config.kv_dim
+            )
+            var v_cache_row = self.state.value_cache.data().offset(
+                loff + pos * self.config.kv_dim
+            )
             memcpy(k_cache_row, self.state.k.data(), self.config.kv_dim)
             memcpy(v_cache_row, self.state.v.data(), self.config.kv_dim)
 
@@ -997,8 +1176,12 @@ struct Transformer:
             for h in range(self.config.n_heads):
                 var q = self.state.q.data().offset(h * self.config.head_size)
                 var att = self.state.att.data().offset(h * self.config.seq_len)
-                for t in range (pos + 1):
-                    var k = self.state.key_cache.data().offset(loff + t * self.config.kv_dim + (h // self.config.kv_mul) * self.config.head_size)
+                for t in range(pos + 1):
+                    var k = self.state.key_cache.data().offset(
+                        loff
+                        + t * self.config.kv_dim
+                        + (h // self.config.kv_mul) * self.config.head_size
+                    )
                     var score: Float32 = 0.0
                     for i in range(self.config.head_size):
                         score += q.load[width=1](i) * k.load[width=1](i)
@@ -1011,13 +1194,25 @@ struct Transformer:
                 var xb = self.state.xb.data().offset(h * self.config.head_size)
                 memset_zero(xb, self.config.head_size)
                 for t in range(pos + 1):
-                    var v = self.state.value_cache.data().offset(loff + t * self.config.kv_dim + (h // self.config.kv_mul) * self.config.head_size)
+                    var v = self.state.value_cache.data().offset(
+                        loff
+                        + t * self.config.kv_dim
+                        + (h // self.config.kv_mul) * self.config.head_size
+                    )
                     var a = self.state.att.load[width=1](t)
                     for i in range(self.config.head_size):
-                        xb.store[width=1](i, xb.load[width=1](i) + a * v.load[width=1](i))
+                        xb.store[width=1](
+                            i, xb.load[width=1](i) + a * v.load[width=1](i)
+                        )
 
-            self.state.x_q.quantize(TensorSlice[DType.float32](self.state.xb, 0))
-            matmul(self.state.xb2, self.state.x_q, QuantizedTensorSlice(self.weights.wo, l))
+            self.state.x_q.quantize(
+                TensorSlice[DType.float32](self.state.xb, 0)
+            )
+            matmul(
+                self.state.xb2,
+                self.state.x_q,
+                QuantizedTensorSlice(self.weights.wo, l),
+            )
 
             for i in range(self.config.dim):
                 var x_i = self.state.x.load[width=1](i)
@@ -1028,22 +1223,38 @@ struct Transformer:
                 self.state.xb.data(),
                 self.state.x.data(),
                 self.weights.rms_ffn_weight.data().offset(l * dim),
-                dim
+                dim,
             )
 
-            self.state.x_q.quantize(TensorSlice[DType.float32](self.state.xb, 0))
-            matmul(self.state.hb, self.state.x_q, QuantizedTensorSlice(self.weights.w1, l))
-            matmul(self.state.hb2, self.state.x_q, QuantizedTensorSlice(self.weights.w3, l))
+            self.state.x_q.quantize(
+                TensorSlice[DType.float32](self.state.xb, 0)
+            )
+            matmul(
+                self.state.hb,
+                self.state.x_q,
+                QuantizedTensorSlice(self.weights.w1, l),
+            )
+            matmul(
+                self.state.hb2,
+                self.state.x_q,
+                QuantizedTensorSlice(self.weights.w3, l),
+            )
 
             # SwiGLU
             for i in range(self.config.hidden_dim):
                 var val = self.state.hb.load[width=1](i)
-                val *= (1.0 / (1.0 + exp(-val)))
+                val *= 1.0 / (1.0 + exp(-val))
                 val *= self.state.hb2.load[width=1](i)
                 self.state.hb.store[width=1](i, val)
 
-            self.state.hb_q.quantize(TensorSlice[DType.float32](self.state.hb, 0))
-            matmul(self.state.xb2, self.state.hb_q, QuantizedTensorSlice(self.weights.w2, l))
+            self.state.hb_q.quantize(
+                TensorSlice[DType.float32](self.state.hb, 0)
+            )
+            matmul(
+                self.state.xb2,
+                self.state.hb_q,
+                QuantizedTensorSlice(self.weights.w2, l),
+            )
 
             for i in range(self.config.dim):
                 var x_i = self.state.x.load[width=1](i)
@@ -1056,14 +1267,8 @@ def test():
         alias N = 4096
         alias group_size = 512
         print("QuantizedTensor test")
-        var qt = QuantizedTensor(
-            TensorShape(N),
-            group_size
-        )
-        var qt_naive = QuantizedTensor(
-            TensorShape(N),
-            group_size
-        )
+        var qt = QuantizedTensor(TensorShape(N), group_size)
+        var qt_naive = QuantizedTensor(TensorShape(N), group_size)
 
         var x = rand[DType.float32](5, N) - 0.5
 
@@ -1100,7 +1305,9 @@ def test():
         # print(x_2_naive.load[width=N](0))
 
         var error = x_1.load[width=N](0) - x_2.load[width=N](0)
-        var error_naive = x_1_naive.load[width=N](0) - x_2_naive.load[width=N](0)
+        var error_naive = x_1_naive.load[width=N](0) - x_2_naive.load[width=N](
+            0
+        )
 
         # print("Error:")
         # print(error)
@@ -1126,7 +1333,6 @@ def test():
 
         _ = x
 
-
     def test_bpe_encode():
         print("BPE encode test")
 
@@ -1138,20 +1344,19 @@ def test():
         bpe_encode(prompt_tokens, "Hello, how are you?", tok)
 
         for i in range(len(prompt_tokens)):
-            if(prompt_tokens[i] != int(gt[i])):
+            if prompt_tokens[i] != int(gt[i]):
                 print("Error at index ", i)
                 print("Expected: ", gt[i])
                 print("Got: ", prompt_tokens[i])
-        
+
         print("BPE encode test passed")
 
-    
     def test_transformer_weights():
         print("Transformer weights test")
         var config = Config("llama3_8b_instruct_q80.bin", True)
         var weights = TransformerWeights("llama3_8b_instruct_q80.bin", config)
         print("Transformer weights test passed")
-    
+
     def test_batch_matmul_i8():
         alias dim = 4096
         alias kv_dim = 1024
@@ -1173,14 +1378,14 @@ def test():
         var v = Tensor[DType.float32](TensorShape(kv_dim))
 
         batch_matmul_i8(
-            StaticTuple[DTypePointer[DType.float32], 2](k.data(), v.data()), 
-            x_q, 
+            StaticTuple[DTypePointer[DType.float32], 2](k.data(), v.data()),
+            x_q,
             StaticTuple[UnsafePointer[QuantizedTensorSlice], 2](
-                UnsafePointer(wk_slice), 
-                UnsafePointer(wv_slice)
-            ), 
-            kv_dim, 
-            dim)
+                UnsafePointer(wk_slice), UnsafePointer(wv_slice)
+            ),
+            kv_dim,
+            dim,
+        )
 
         print("Quantized batch matmul test")
         print("x_q:", x_q._quantized.data()[0], " ", x_q._scale.data()[0])
@@ -1192,7 +1397,7 @@ def test():
         if k.data()[0] - 40.96 > 1e-2:
             print("Error: k.data()[0] != 64")
             return
-        
+
         if v.data()[0] - 40.96 > 1e-2:
             print("Error: v.data()[0] != 64")
             return
@@ -1205,13 +1410,12 @@ def test():
 
         print("Quantized batch matmul test passed")
 
-
     # test_quantized_tensor()
     # test_bpe_encode()
     # test_transformer_weights()
     test_batch_matmul_i8()
 
+
 def main():
     workers = num_performance_cores()
     test()
-    
