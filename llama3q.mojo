@@ -1,6 +1,6 @@
 from tensor import Tensor, TensorShape, rand
 from algorithm import vectorize, parallelize
-from math import abs, round
+from math import abs, round, pow, cos, sin, sqrt, exp
 from sys.info import num_performance_cores
 from memory import memset
 
@@ -752,7 +752,7 @@ struct Accumulator[T: DType, width: Int]:
 
 @always_inline
 fn rmsnorm(
-    inout o: DTypePointer[DType.float32],
+    o: DTypePointer[DType.float32],
     x: DTypePointer[DType.float32],
     weight: DTypePointer[DType.float32],
     size: Int,
@@ -790,11 +790,11 @@ fn rmsnorm(inout o: Tensor[DType.float32], x: Tensor[DType.float32], weight: Ten
 
 @always_inline
 fn softmax(inout x: Tensor[DType.float32]) -> None:
-    softmax(x, 0, x.dim(0))
+    softmax(x.data(), 0, x.dim(0))
 
 
 @always_inline
-fn softmax(inout x: Tensor[DType.float32], start: Int, end: Int):
+fn softmax(x: DTypePointer[DType.float32], start: Int, end: Int):
     var max_val: Float32 = -1e9
 
     @parameter
@@ -904,6 +904,151 @@ fn batch_matmul_i8[
             C[idx].store(i, val[idx])
         
     parallelize[compute_row](rows, workers)
+
+
+fn matmul(
+    inout C: Tensor[DType.float32],
+    borrowed A: QuantizedTensor,
+    B: QuantizedTensorSlice,
+):
+    batch_matmul_i8[1](
+        StaticTuple[DTypePointer[DType.float32], 1](C.data()),
+        A,
+        StaticTuple[UnsafePointer[QuantizedTensorSlice], 1](UnsafePointer[QuantizedTensorSlice](B)),
+        B.dim(0),
+        B.dim(1),
+    )
+
+fn matmul(
+    C: TensorSlice[DType.float32],
+    borrowed A: QuantizedTensor,
+    B: QuantizedTensorSlice,
+):
+    batch_matmul_i8[1](
+        StaticTuple[DTypePointer[DType.float32], 1](C.data()),
+        A,
+        StaticTuple[UnsafePointer[QuantizedTensorSlice], 1](UnsafePointer[QuantizedTensorSlice](B)),
+        B.dim(0),
+        B.dim(1),
+    )
+
+struct Transformer:
+    var config: Config
+    var weights: TransformerWeights
+    var state: RunState
+
+    fn __init__(inout self, path: StringLiteral) raises:
+        self.config = Config(path, False)
+        self.weights = TransformerWeights(path, self.config)
+        self.state = RunState(self.config)
+
+    fn forward(inout self, token: Int32, pos: Int) raises:
+
+        var dim = self.config.dim
+
+        memcpy(
+            self.state.x.data(),
+            self.weights.token_embedding_table.data().offset(token * self.config.dim),
+            dim # not bytes
+        )
+
+        for l in range(self.config.n_layers):
+
+            rmsnorm(
+                self.state.xb.data(),
+                self.state.x.data(),
+                self.weights.rms_att_weight.data().offset(l * dim),
+                dim
+            )
+            self.state.x_q.quantize(TensorSlice[DType.float32](self.state.xb, 0))
+            
+            matmul(self.state.q, self.state.x_q, QuantizedTensorSlice(self.weights.wq, l));
+            matmul(self.state.k, self.state.x_q, QuantizedTensorSlice(self.weights.wk, l));
+            matmul(self.state.v, self.state.x_q, QuantizedTensorSlice(self.weights.wv, l));
+
+            # TODO: accelerate RoPE
+            for i in range(self.config.n_heads):
+                for j in range(self.config.head_size):
+                    var freq = 1.0 / pow(500000.0, j / self.config.head_size)
+                    var val = pos * freq
+                    var fcr = cos(val)
+                    var fci = sin(val)
+
+                    var q0 = self.state.q.load[width=1](i * self.config.head_size + j)
+                    var k0 = self.state.k.load[width=1](i * self.config.head_size + j)
+
+                    self.state.q.store[width=1](i * self.config.head_size + j, q0 * fcr - k0 * fci)
+                    self.state.k.store[width=1](i * self.config.head_size + j + 1, q0 * fci + k0 * fcr)
+                    if i < self.config.n_kv_heads:
+                        var k0 = self.state.k.load[width=1](i * self.config.head_size + j)
+                        var k1 = self.state.k.load[width=1](i * self.config.head_size + j + 1)
+
+                        self.state.k.store[width=1](i * self.config.head_size + j, k0 * fcr - k1 * fci)
+                        self.state.k.store[width=1](i * self.config.head_size + j + 1, k0 * fci + k1 * fcr)
+
+            # kv cache
+            var loff = l * self.config.seq_len * self.config.kv_dim
+            var k_cache_row = self.state.key_cache.data().offset(loff + pos * self.config.kv_dim)
+            var v_cache_row = self.state.value_cache.data().offset(loff + pos * self.config.kv_dim)
+            memcpy(k_cache_row, self.state.k.data(), self.config.kv_dim)
+            memcpy(v_cache_row, self.state.v.data(), self.config.kv_dim)
+
+            # TODO: parallelize
+            for h in range(self.config.n_heads):
+                var q = self.state.q.data().offset(h * self.config.head_size)
+                var att = self.state.att.data().offset(h * self.config.seq_len)
+                for t in range (pos + 1):
+                    var k = self.state.key_cache.data().offset(loff + t * self.config.kv_dim + (h // self.config.kv_mul) * self.config.head_size)
+                    var score: Float32 = 0.0
+                    for i in range(self.config.head_size):
+                        score += q.load[width=1](i) * k.load[width=1](i)
+
+                    score /= sqrt(self.config.head_size)
+                    att.store(t, score)
+
+                softmax(att, 0, pos + 1)
+
+                var xb = self.state.xb.data().offset(h * self.config.head_size)
+                memset_zero(xb, self.config.head_size)
+                for t in range(pos + 1):
+                    var v = self.state.value_cache.data().offset(loff + t * self.config.kv_dim + (h // self.config.kv_mul) * self.config.head_size)
+                    var a = self.state.att.load[width=1](t)
+                    for i in range(self.config.head_size):
+                        xb.store[width=1](i, xb.load[width=1](i) + a * v.load[width=1](i))
+
+            self.state.x_q.quantize(TensorSlice[DType.float32](self.state.xb, 0))
+            matmul(self.state.xb2, self.state.x_q, QuantizedTensorSlice(self.weights.wo, l))
+
+            for i in range(self.config.dim):
+                var x_i = self.state.x.load[width=1](i)
+                var xb2_i = self.state.xb2.load[width=1](i)
+                self.state.x.store[width=1](i, x_i + xb2_i)
+
+            rmsnorm(
+                self.state.xb.data(),
+                self.state.x.data(),
+                self.weights.rms_ffn_weight.data().offset(l * dim),
+                dim
+            )
+
+            self.state.x_q.quantize(TensorSlice[DType.float32](self.state.xb, 0))
+            matmul(self.state.hb, self.state.x_q, QuantizedTensorSlice(self.weights.w1, l))
+            matmul(self.state.hb2, self.state.x_q, QuantizedTensorSlice(self.weights.w3, l))
+
+            # SwiGLU
+            for i in range(self.config.hidden_dim):
+                var val = self.state.hb.load[width=1](i)
+                val *= (1.0 / (1.0 + exp(-val)))
+                val *= self.state.hb2.load[width=1](i)
+                self.state.hb.store[width=1](i, val)
+
+            self.state.hb_q.quantize(TensorSlice[DType.float32](self.state.hb, 0))
+            matmul(self.state.xb2, self.state.hb_q, QuantizedTensorSlice(self.weights.w2, l))
+
+            for i in range(self.config.dim):
+                var x_i = self.state.x.load[width=1](i)
+                var xb_i = self.state.xb.load[width=1](i)
+                self.state.x.store[width=1](i, x_i + xb_i)
 
 
 def test():
