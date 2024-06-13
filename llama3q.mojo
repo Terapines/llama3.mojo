@@ -1016,7 +1016,9 @@ fn batch_matmul_i8[
         var val = InlineArray[Float32, n](0)
         var offset = i * cols
         for j in range(cols // group_size):
-            var ival = InlineArray[Accumulator[DType.int32, nelts_q32], n]()
+            var ival = InlineArray[Accumulator[DType.int32, nelts_q32], n](
+                unsafe_uninitialized=True
+            )
 
             @parameter
             for k in range(n):
