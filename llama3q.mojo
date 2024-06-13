@@ -301,7 +301,9 @@ struct QuantizedTensorSlice:
         self._quantized = qt._quantized.unsafe_ptr().offset(
             layer * num_layer_quantized_elements
         )
-        self._scale = qt._scale.unsafe_ptr().offset(layer * num_layer_scale_elements)
+        self._scale = qt._scale.unsafe_ptr().offset(
+            layer * num_layer_scale_elements
+        )
 
         if qt._quantized.rank() == 2:
             self._shape = TensorShape(qt._quantized.dim(1))
@@ -840,8 +842,9 @@ struct TransformerWeights:
 
 
 # From: llama2.mojo
+@value
 @register_passable
-struct Accumulator[T: DType, width: Int]:
+struct Accumulator[T: DType, width: Int](CollectionElement):
     # ideally this could be SIMD[T, width] but the width
     # in accumulate() method is compared by identity
     var data: DTypePointer[T]
@@ -900,7 +903,12 @@ fn rmsnorm(
     x: Tensor[DType.float32],
     weight: Tensor[DType.float32],
 ):
-    rmsnorm(o._ptr, x.unsafe_ptr(), weight.unsafe_ptr(), weight.dim(weight.rank() - 1))
+    rmsnorm(
+        o._ptr,
+        x.unsafe_ptr(),
+        weight.unsafe_ptr(),
+        weight.dim(weight.rank() - 1),
+    )
 
 
 @always_inline
@@ -909,7 +917,9 @@ fn rmsnorm(
     x: Tensor[DType.float32],
     weight: TensorSlice[DType.float32],
 ):
-    rmsnorm(o._ptr, x.unsafe_ptr(), weight.data(), weight.dim(weight.rank() - 1))
+    rmsnorm(
+        o._ptr, x.unsafe_ptr(), weight.data(), weight.dim(weight.rank() - 1)
+    )
 
 
 @always_inline
@@ -964,7 +974,7 @@ fn batch_matmul_fp32[
     fn compute_row(i: Int):
         var tmp = InlineArray[Accumulator[DType.float32, nelts_f32], n]()
 
-        @unroll
+        @parameter
         for k in range(n):
             tmp[k] = Accumulator[DType.float32, nelts_f32]()
 
@@ -974,13 +984,13 @@ fn batch_matmul_fp32[
         fn dot[_nelts: Int](j: Int):
             var a = A.load[width=_nelts](j)
 
-            @unroll
+            @parameter
             for k in range(n):
                 tmp[k].accumulate(a * B[k].load[width=_nelts](row_offset + j))
 
         vectorize[dot, nelts_f32](cols)
 
-        @unroll
+        @parameter
         for k in range(n):
             C[k].store(i, tmp[k].total())
 
@@ -991,9 +1001,9 @@ fn batch_matmul_fp32[
 fn batch_matmul_i8[
     n: Int
 ](
-    C: StaticTuple[DTypePointer[DType.float32], n],
+    C: InlineArray[DTypePointer[DType.float32], n],
     A: QuantizedTensor,
-    B: StaticTuple[UnsafePointer[QuantizedTensorSlice], n],
+    B: InlineArray[UnsafePointer[QuantizedTensorSlice], n],
     rows: Int,
     cols: Int,
 ):
@@ -1003,18 +1013,18 @@ fn batch_matmul_i8[
 
     @parameter
     fn compute_row(i: Int):
-        var val = StaticTuple[Float32, n](0)
+        var val = InlineArray[Float32, n](0)
         var offset = i * cols
         for j in range(cols // group_size):
-            var ival = StaticTuple[Accumulator[DType.int32, nelts_q32], n]()
+            var ival = InlineArray[Accumulator[DType.int32, nelts_q32], n]()
 
-            @unroll
+            @parameter
             for k in range(n):
                 ival[k] = Accumulator[DType.int32, nelts_q32]()
 
             @parameter
             fn dot[_nelts: Int](k: Int):
-                @unroll
+                @parameter
                 for idx in range(n):
                     ival[idx].accumulate(
                         A._quantized.load[width=_nelts](
@@ -1029,7 +1039,7 @@ fn batch_matmul_i8[
 
             vectorize[dot, nelts_q32](group_size)
 
-            @unroll
+            @parameter
             for idx in range(n):
                 val[idx] += (
                     ival[idx].total().cast[DType.float32]()
@@ -1037,7 +1047,7 @@ fn batch_matmul_i8[
                     * B[idx][]._scale.load[width=1](offset // group_size + j)
                 )
 
-        @unroll
+        @parameter
         for idx in range(n):
             C[idx].store(i, val[idx])
 
@@ -1050,9 +1060,9 @@ fn matmul(
     B: QuantizedTensorSlice,
 ):
     batch_matmul_i8[1](
-        StaticTuple[DTypePointer[DType.float32], 1](C.data()),
+        InlineArray[DTypePointer[DType.float32], 1](C.unsafe_ptr()),
         A,
-        StaticTuple[UnsafePointer[QuantizedTensorSlice], 1](
+        InlineArray[UnsafePointer[QuantizedTensorSlice], 1](
             UnsafePointer[QuantizedTensorSlice](B)
         ),
         B.dim(0),
@@ -1066,9 +1076,9 @@ fn matmul(
     B: QuantizedTensorSlice,
 ):
     batch_matmul_i8[1](
-        StaticTuple[DTypePointer[DType.float32], 1](C.data()),
+        InlineArray[DTypePointer[DType.float32], 1](C.data()),
         A,
-        StaticTuple[UnsafePointer[QuantizedTensorSlice], 1](
+        InlineArray[UnsafePointer[QuantizedTensorSlice], 1](
             UnsafePointer[QuantizedTensorSlice](B)
         ),
         B.dim(0),
@@ -1090,8 +1100,8 @@ struct Transformer:
         var dim = self.config.dim
 
         memcpy(
-            self.state.x.data(),
-            self.weights.token_embedding_table.data().offset(
+            self.state.x.unsafe_ptr(),
+            self.weights.token_embedding_table.unsafe_ptr().offset(
                 token * self.config.dim
             ),
             dim,  # not bytes
@@ -1099,9 +1109,9 @@ struct Transformer:
 
         for l in range(self.config.n_layers):
             rmsnorm(
-                self.state.xb.data(),
-                self.state.x.data(),
-                self.weights.rms_att_weight.data().offset(l * dim),
+                self.state.xb.unsafe_ptr(),
+                self.state.x.unsafe_ptr(),
+                self.weights.rms_att_weight.unsafe_ptr().offset(l * dim),
                 dim,
             )
             self.state.x_q.quantize(
@@ -1163,10 +1173,10 @@ struct Transformer:
 
             # kv cache
             var loff = l * self.config.seq_len * self.config.kv_dim
-            var k_cache_row = self.state.key_cache.data().offset(
+            var k_cache_row = self.state.key_cache.unsafe_ptr().offset(
                 loff + pos * self.config.kv_dim
             )
-            var v_cache_row = self.state.value_cache.data().offset(
+            var v_cache_row = self.state.value_cache.unsafe_ptr().offset(
                 loff + pos * self.config.kv_dim
             )
             memcpy(k_cache_row, self.state.k.data(), self.config.kv_dim)
@@ -1174,10 +1184,14 @@ struct Transformer:
 
             # TODO: parallelize
             for h in range(self.config.n_heads):
-                var q = self.state.q.data().offset(h * self.config.head_size)
-                var att = self.state.att.data().offset(h * self.config.seq_len)
+                var q = self.state.q.unsafe_ptr().offset(
+                    h * self.config.head_size
+                )
+                var att = self.state.att.unsafe_ptr().offset(
+                    h * self.config.seq_len
+                )
                 for t in range(pos + 1):
-                    var k = self.state.key_cache.data().offset(
+                    var k = self.state.key_cache.unsafe_ptr().offset(
                         loff
                         + t * self.config.kv_dim
                         + (h // self.config.kv_mul) * self.config.head_size
@@ -1191,10 +1205,12 @@ struct Transformer:
 
                 softmax(att, 0, pos + 1)
 
-                var xb = self.state.xb.data().offset(h * self.config.head_size)
+                var xb = self.state.xb.unsafe_ptr().offset(
+                    h * self.config.head_size
+                )
                 memset_zero(xb, self.config.head_size)
                 for t in range(pos + 1):
-                    var v = self.state.value_cache.data().offset(
+                    var v = self.state.value_cache.unsafe_ptr().offset(
                         loff
                         + t * self.config.kv_dim
                         + (h // self.config.kv_mul) * self.config.head_size
@@ -1220,9 +1236,9 @@ struct Transformer:
                 self.state.x.store[width=1](i, x_i + xb2_i)
 
             rmsnorm(
-                self.state.xb.data(),
-                self.state.x.data(),
-                self.weights.rms_ffn_weight.data().offset(l * dim),
+                self.state.xb.unsafe_ptr(),
+                self.state.x.unsafe_ptr(),
+                self.weights.rms_ffn_weight.unsafe_ptr().offset(l * dim),
                 dim,
             )
 
@@ -1378,9 +1394,11 @@ def test():
         var v = Tensor[DType.float32](TensorShape(kv_dim))
 
         batch_matmul_i8(
-            StaticTuple[DTypePointer[DType.float32], 2](k.data(), v.data()),
+            InlineArray[DTypePointer[DType.float32], 2](
+                k.unsafe_ptr(), v.unsafe_ptr()
+            ),
             x_q,
-            StaticTuple[UnsafePointer[QuantizedTensorSlice], 2](
+            InlineArray[UnsafePointer[QuantizedTensorSlice], 2](
                 UnsafePointer(wk_slice), UnsafePointer(wv_slice)
             ),
             kv_dim,
@@ -1388,18 +1406,27 @@ def test():
         )
 
         print("Quantized batch matmul test")
-        print("x_q:", x_q._quantized.data()[0], " ", x_q._scale.data()[0])
-        print("wk:", wk._quantized.data()[0], " ", wk._scale.data()[0])
-        print("wv:", wv._quantized.data()[0], " ", wv._scale.data()[0])
-        print("k:", k.data()[0])
-        print("v:", v.data()[0])
+        print(
+            "x_q:",
+            x_q._quantized.unsafe_ptr()[0],
+            " ",
+            x_q._scale.unsafe_ptr()[0],
+        )
+        print(
+            "wk:", wk._quantized.unsafe_ptr()[0], " ", wk._scale.unsafe_ptr()[0]
+        )
+        print(
+            "wv:", wv._quantized.unsafe_ptr()[0], " ", wv._scale.unsafe_ptr()[0]
+        )
+        print("k:", k.unsafe_ptr()[0])
+        print("v:", v.unsafe_ptr()[0])
 
-        if k.data()[0] - 40.96 > 1e-2:
-            print("Error: k.data()[0] != 64")
+        if k.unsafe_ptr()[0] - 40.96 > 1e-2:
+            print("Error: k.unsafe_ptr()[0] != 64")
             return
 
-        if v.data()[0] - 40.96 > 1e-2:
-            print("Error: v.data()[0] != 64")
+        if v.unsafe_ptr()[0] - 40.96 > 1e-2:
+            print("Error: v.unsafe_ptr()[0] != 64")
             return
 
         _ = x_q
@@ -1409,10 +1436,10 @@ def test():
         _ = v
 
         print("Quantized batch matmul test passed")
-    
+
     def test_transformer():
         print("Transformer test")
-        
+
         var transformer = Transformer("llama3_8b_instruct_q80.bin")
         var tok = Tokenizer(transformer.config.vocab_size, "tokenizer.bin")
 
@@ -1460,7 +1487,7 @@ def test():
             # Advance forward
             token = next_token
             pos += 1
-            
+
             print("Transformer test passed")
 
     # test_quantized_tensor()
