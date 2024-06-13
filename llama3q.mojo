@@ -102,7 +102,10 @@ struct QuantizedTensor:
         self._scale = Tensor[DType.float32](TensorShape(num_scale_factors))
         self._group_size = group_size
 
-    fn dequantize(self, dequantized: TensorSlice[DType.float32]):
+    fn __str__(self) -> String:
+        return "QuantizedTensor: " + str(self._quantized)
+
+    fn dequantize(self, owned dequantized: TensorSlice[DType.float32]):
         """Dequantize the tensor into `dequantized`.
 
         Args:
@@ -130,7 +133,7 @@ struct QuantizedTensor:
 
         parallelize[dequantize_group](num_groups, num_groups)
 
-    fn dequantize_naive(self, dequantized: TensorSlice[DType.float32]):
+    fn dequantize_naive(self, owned dequantized: TensorSlice[DType.float32]):
         """Dequantize the tensor into `dequantized`. Uses a naive implementation.
 
         Args:
@@ -147,7 +150,7 @@ struct QuantizedTensor:
             ]()
             dequantized.store[width=1](i, quantized_lane * scale_factor)
 
-    fn quantize(inout self, dequantized: TensorSlice[DType.float32]) raises:
+    fn quantize(inout self, owned dequantized: TensorSlice[DType.float32]) raises:
         """Quantize the `dequantized` and update self.
 
         Args:
@@ -210,7 +213,7 @@ struct QuantizedTensor:
         return self._quantized.rank()
 
     fn quantize_naive(
-        inout self, dequantized: TensorSlice[DType.float32]
+        inout self, owned dequantized: TensorSlice[DType.float32]
     ) raises:
         """Quantize the `dequantized` and update self. Uses a naive implementation.
 
@@ -1148,8 +1151,13 @@ fn transformer(
     var content_row = weights.token_embedding_table.unsafe_ptr().offset(token * dim)
     memcpy(state.x.unsafe_ptr(), content_row, dim)
 
+    print("state.x: ", state.x)
+
     for l in range(config.n_layers):
         rmsnorm(state.xb, state.x, TensorSlice(weights.rms_att_weight, l))
+
+        print("state.xb: ", state.xb)
+
         var loff = l * config.seq_len * kv_dim
         state.k = TensorSlice(state.key_cache, l, pos)
         state.v = TensorSlice(state.value_cache, l, pos)
@@ -1192,6 +1200,9 @@ fn transformer(
         rope_rotation_llama(state, pos, config)
 
         memset_zero(state.xb.unsafe_ptr(), state.xb.num_elements())
+
+        print("state.q: ", state.q)
+
 
         # Multihead attention. Iterate over all heads in parallel.
         @parameter
@@ -1288,8 +1299,12 @@ fn transformer(
     rmsnorm(state.x, state.x, weights.rms_final_weight)
 
     state.x_q.quantize(state.x)
+    # print("final state.x: ", state.x)
+    # print("wcls:", weights.wcls)
+    # print("state.x_q:", state.x_q)
+    # print("state.logits:", state.logits)
     # Classifier into logits
-    matmul(state.logits, state.x_q, weights.wcls)
+    matmul(state.logits, state.x_q, QuantizedTensorSlice(weights.wcls, 0))
 
 
 def test():
@@ -1479,6 +1494,7 @@ def test():
                 # # Sample the next token
                 # if temperature == 0.0:
                 # Greedy argmax sampling: take the token with the highest probability
+                print(state.logits)
                 next_token = int(state.logits.argmax()[0])
                 # else:
                 #     # Apply the temperature to the logits
@@ -1494,7 +1510,10 @@ def test():
                 if next_token == 1 or next_token == 2:
                     break
 
+            print(next_token)
+
             var token_str: String = tok.vocab[next_token]
+
             if token == 1 and token_str._buffer[0] == ord(" "):
                 token_str = token_str[1:]
 
