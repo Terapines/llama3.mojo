@@ -27,6 +27,10 @@ struct TensorSlice[type: DType]:
         self._data = ptr
         self._shape = shape
 
+    fn __init__(inout self, t: Tensor[type]):
+        self._data = t.unsafe_ptr()
+        self._shape = t.shape()
+
     fn __init__(inout self, t: Tensor[type], layer: Int) raises:
         var num_layer_elements = t.shape().num_elements() / t.dim(0)
 
@@ -54,6 +58,9 @@ struct TensorSlice[type: DType]:
 
     fn __getitem__(self, idx: Int) -> SIMD[type, 1]:
         return self._data.load[width=1](idx)
+    
+    fn __setitem__(inout self, idx: Int, value: SIMD[type, 1]):
+        self._data.store[width=1](idx, value)
 
     fn load[width: Int](self, idx: Int) -> SIMD[type, width]:
         return self._data.load[width=width](idx)
@@ -341,6 +348,12 @@ struct QuantizedTensorSlice:
         else:
             raise Error("unimplemented rank")
 
+        self._group_size = qt._group_size
+    
+    fn __init__(inout self, qt: QuantizedTensor) raises:
+        self._quantized = qt._quantized.unsafe_ptr()
+        self._scale = qt._scale.unsafe_ptr()
+        self._shape = qt._quantized.shape()
         self._group_size = qt._group_size
 
     fn __getitem__(self, idx: Int) -> SIMD[DType.int8, 1]:
@@ -661,9 +674,6 @@ struct TransformerWeights:
     var rms_att_weight: Tensor[DType.float32]
     var rms_ffn_weight: Tensor[DType.float32]
 
-    # var freq_cis_real: TensorF32
-    # var freq_cis_imag: TensorF32
-
     var wq: QuantizedTensor
     var wk: QuantizedTensor
     var wv: QuantizedTensor
@@ -924,11 +934,11 @@ fn rmsnorm(
 
 @always_inline
 fn softmax(inout x: Tensor[DType.float32]) -> None:
-    softmax(x.unsafe_ptr(), 0, x.dim(0))
+    softmax(x, 0, x.dim(0))
 
 
 @always_inline
-fn softmax(x: DTypePointer[DType.float32], start: Int, end: Int):
+fn softmax(inout x: Tensor[DType.float32], start: Int, end: Int):
     var max_val: Float32 = -1e9
 
     @parameter
@@ -1003,7 +1013,7 @@ fn batch_matmul_i8[
 ](
     C: InlineArray[DTypePointer[DType.float32], n],
     A: QuantizedTensor,
-    B: InlineArray[UnsafePointer[QuantizedTensorSlice], n],
+    B: InlineArray[QuantizedTensorSlice, n],
     rows: Int,
     cols: Int,
 ):
@@ -1032,7 +1042,7 @@ fn batch_matmul_i8[
                         A._quantized.load[width=_nelts](
                             k + j * group_size
                         ).cast[DType.int32]()
-                        * B[idx][]
+                        * B[idx]
                         ._quantized.load[width=_nelts](
                             k + offset + j * group_size
                         )
@@ -1046,7 +1056,7 @@ fn batch_matmul_i8[
                 val[idx] += (
                     ival[idx].total().cast[DType.float32]()
                     * A._scale.load[width=1](j)
-                    * B[idx][]._scale.load[width=1](offset // group_size + j)
+                    * B[idx]._scale.load[width=1](offset // group_size + j)
                 )
 
         @parameter
@@ -1064,9 +1074,7 @@ fn matmul(
     batch_matmul_i8[1](
         InlineArray[DTypePointer[DType.float32], 1](C.unsafe_ptr()),
         A,
-        InlineArray[UnsafePointer[QuantizedTensorSlice], 1](
-            UnsafePointer[QuantizedTensorSlice](B)
-        ),
+        B,
         B.dim(0),
         B.dim(1),
     )
@@ -1080,204 +1088,208 @@ fn matmul(
     batch_matmul_i8[1](
         InlineArray[DTypePointer[DType.float32], 1](C.data()),
         A,
-        InlineArray[UnsafePointer[QuantizedTensorSlice], 1](
-            UnsafePointer[QuantizedTensorSlice](B)
-        ),
+        B,
         B.dim(0),
         B.dim(1),
     )
 
+# fn matmul(
+#     C: 
+# )
 
-struct Transformer:
-    var config: Config
-    var weights: TransformerWeights
-    var state: RunState
+# Apply RoPE rotation to the q and k vectors for each head
+# rotate odd and even dim
+@always_inline
+fn rope_rotation_llama(
+    inout state: RunState,
+    pos: Int,
+    config: Config,
+) -> None:
+    # stories model, llama2
+    var head_size = config.head_size
 
-    fn __init__(inout self, path: StringLiteral) raises:
-        self.config = Config(path, False)
-        self.weights = TransformerWeights(path, self.config)
-        self.state = RunState(self.config)
+    @parameter
+    fn head_loop(i: Int):
+        # Simple vectorization with (head_size // 2) steps gave junk transformer output.
+        # Maybe because the nelt ranges end up overlapping between the steps.
+        for j in range(0, config.head_size, 2):
+            var freq = 1.0 / pow(500000.0, j / config.head_size)
+            var val = pos * freq
+            var fcr = cos(val)
+            var fci = sin(val)
+            var q0 = state.q[i * head_size + j]
+            var q1 = state.q[i * head_size + j + 1]
+            state.q[i * head_size + j] = q0 * fcr - q1 * fci
+            state.q[i * head_size + j + 1] = q0 * fci + q1 * fcr
+            if i < config.n_kv_heads:
+                var k0 = state.k[i * head_size + j]
+                var k1 = state.k[i * head_size + j + 1]
+                state.k[i * head_size + j] = k0 * fcr - k1 * fci
+                state.k[i * head_size + j + 1] = k0 * fci + k1 * fcr
 
-    fn forward(inout self, token: Int32, pos: Int) raises:
-        var dim = self.config.dim
+    parallelize[head_loop](config.n_heads, workers)
 
-        memcpy(
-            self.state.x.unsafe_ptr(),
-            self.weights.token_embedding_table.unsafe_ptr().offset(
-                token * self.config.dim
+@always_inline
+fn transformer(
+    token: Int,
+    pos: Int,
+    config: Config,
+    inout state: RunState,
+    weights: TransformerWeights,
+) raises -> None:
+    # A few convenience variables
+    var dim = config.dim
+    var hidden_dim = config.hidden_dim
+    var head_size = config.head_size
+    var kv_dim = config.kv_dim
+    var kv_mul = config.kv_mul
+
+    # Copy the token embedding into x
+    var content_row = weights.token_embedding_table.unsafe_ptr().offset(token * dim)
+    memcpy(state.x.unsafe_ptr(), content_row, dim)
+
+    for l in range(config.n_layers):
+        rmsnorm(state.xb, state.x, TensorSlice(weights.rms_att_weight, l))
+        var loff = l * config.seq_len * kv_dim
+        state.k = TensorSlice(state.key_cache, l, pos)
+        state.v = TensorSlice(state.value_cache, l, pos)
+
+        # Quantize x
+        state.x_q.quantize(state.xb)
+
+        if kv_dim == dim:
+            batch_matmul_i8[3](
+                InlineArray[DTypePointer[DType.float32], 3](
+                    state.q.unsafe_ptr(),
+                    state.k.data(),
+                    state.v.data(),
+                ),
+                state.x_q,
+                InlineArray[QuantizedTensorSlice, 3](
+                    QuantizedTensorSlice(weights.wq, l),
+                    QuantizedTensorSlice(weights.wk, l),
+                    QuantizedTensorSlice(weights.wv, l),
+                ),
+                dim,
+                dim
+            )
+        else:
+            matmul(state.q, state.x_q, QuantizedTensorSlice(weights.wq, l))
+            batch_matmul_i8[2](
+                InlineArray[DTypePointer[DType.float32], 2](
+                    state.k.data(),
+                    state.v.data(),
+                ),
+                state.x_q,
+                InlineArray[QuantizedTensorSlice, 2](
+                    QuantizedTensorSlice(weights.wk, l),
+                    QuantizedTensorSlice(weights.wv, l),
+                ),
+                kv_dim,
+                dim
+            )
+        
+        rope_rotation_llama(state, pos, config)
+
+        memset_zero(state.xb.unsafe_ptr(), state.xb.num_elements())
+
+        # Multihead attention. Iterate over all heads in parallel.
+        @parameter
+        fn loop_over_heads(h: Int):
+            # Get the query vector for this head
+            var q_offset = h * head_size
+
+            # Index of attention scores for this head
+            var att_offset = h * config.seq_len
+
+            # Iterate over all timesteps, including the current one
+            for t in range(pos + 1):
+                # Starting index of the key vector for this head and at this timestep
+                var k_offset = loff + t * kv_dim + (h // kv_mul) * head_size
+                # Calculate the attention score as the dot product of q and k
+                var score: Float32 = 0.0
+
+                @parameter
+                fn score_fn[_nelts: Int](i: Int):
+                    score += (
+                        state.q.load[width=_nelts](q_offset + i)
+                        * state.key_cache.load[width=_nelts](k_offset + i)
+                    ).reduce_add()
+
+                vectorize[score_fn, nelts_f32](head_size)
+                score /= math.sqrt[DType.float32, 1](head_size)
+
+                # Save the score to the attention buffer
+                state.att[att_offset + t] = score
+
+            # Softmax the scores to get attention weights, from 0..pos inclusively
+            softmax(state.att, att_offset, att_offset + pos + 1)
+            # Weighted sum of the values, store back into xb
+            var xb_offset = h * head_size
+            for t in range(pos + 1):
+                # Starting index of the value vector for this head and at this timestep
+                var v_offset = loff + t * kv_dim + (h // kv_mul) * head_size
+
+                # Get the attention weight for this timestep
+                var a = state.att[att_offset + t]
+                # Accumulate the weighted value into xb
+
+                @parameter
+                fn xb_accumulate[_nelts: Int](i: Int):
+                    var xbi = state.xb.load[width=_nelts](
+                        xb_offset + i
+                    ) + a * state.value_cache.load[width=_nelts](v_offset + i)
+                    state.xb.store[width=_nelts](xb_offset + i, xbi)
+
+                vectorize[xb_accumulate, nelts_f32](head_size)
+
+        parallelize[loop_over_heads](config.n_heads, workers)
+        state.x_q.quantize(state.xb)
+        # Final matrix multiplication to get the output of the attention
+        matmul(state.xb2, state.x_q, QuantizedTensorSlice(weights.wo, l))
+        # Residual connection back into x
+        state.x = state.x + state.xb2
+        # FFN rmsnorm
+        rmsnorm(state.xb, state.x, TensorSlice(weights.rms_ffn_weight, l))
+        state.x_q.quantize(state.xb)
+
+        # Calculate self.w1(x) and self.w3(x) for FFN
+        batch_matmul_i8[2](
+            InlineArray[DTypePointer[DType.float32], 2](
+                state.hb.unsafe_ptr(),
+                state.hb2.unsafe_ptr(),
             ),
-            dim,  # not bytes
+            state.x_q,
+            InlineArray[QuantizedTensorSlice, 2](
+                QuantizedTensorSlice(weights.w1, l),
+                QuantizedTensorSlice(weights.w3, l),
+            ),
+            hidden_dim,
+            dim,
         )
 
-        for l in range(self.config.n_layers):
-            rmsnorm(
-                self.state.xb.unsafe_ptr(),
-                self.state.x.unsafe_ptr(),
-                self.weights.rms_att_weight.unsafe_ptr().offset(l * dim),
-                dim,
-            )
-            self.state.x_q.quantize(
-                TensorSlice[DType.float32](self.state.xb, 0)
-            )
+        @parameter
+        fn swiglu[_nelts: Int](i: Int):
+            var val = state.hb.load[width=_nelts](i)
+            val *= 1.0 / (1.0 + exp(-val))
+            val *= state.hb2.load[width=_nelts](i)
+            state.hb.store[width=_nelts](i, val)
+        
+        vectorize[swiglu, nelts_f32](config.hidden_dim)
 
-            matmul(
-                self.state.q,
-                self.state.x_q,
-                QuantizedTensorSlice(self.weights.wq, l),
-            )
-            matmul(
-                self.state.k,
-                self.state.x_q,
-                QuantizedTensorSlice(self.weights.wk, l),
-            )
-            matmul(
-                self.state.v,
-                self.state.x_q,
-                QuantizedTensorSlice(self.weights.wv, l),
-            )
+        state.hb_q.quantize(state.hb)
+        # Final matrix multiplication to get the output of the FFN
+        matmul(state.xb, state.hb_q, QuantizedTensorSlice(weights.w2, l))
 
-            # TODO: accelerate RoPE
-            for i in range(self.config.n_heads):
-                for j in range(self.config.head_size):
-                    var freq = 1.0 / pow(500000.0, j / self.config.head_size)
-                    var val = pos * freq
-                    var fcr = cos(val)
-                    var fci = sin(val)
+        # Residual connection
+        state.x = state.x + state.xb
 
-                    var q0 = self.state.q.load[width=1](
-                        i * self.config.head_size + j
-                    )
-                    var k0 = self.state.k.load[width=1](
-                        i * self.config.head_size + j
-                    )
+        # Final rmsnorm
+    rmsnorm(state.x, state.x, weights.rms_final_weight)
 
-                    self.state.q.store[width=1](
-                        i * self.config.head_size + j, q0 * fcr - k0 * fci
-                    )
-                    self.state.k.store[width=1](
-                        i * self.config.head_size + j + 1, q0 * fci + k0 * fcr
-                    )
-                    if i < self.config.n_kv_heads:
-                        var k0 = self.state.k.load[width=1](
-                            i * self.config.head_size + j
-                        )
-                        var k1 = self.state.k.load[width=1](
-                            i * self.config.head_size + j + 1
-                        )
-
-                        self.state.k.store[width=1](
-                            i * self.config.head_size + j, k0 * fcr - k1 * fci
-                        )
-                        self.state.k.store[width=1](
-                            i * self.config.head_size + j + 1,
-                            k0 * fci + k1 * fcr,
-                        )
-
-            # kv cache
-            var loff = l * self.config.seq_len * self.config.kv_dim
-            var k_cache_row = self.state.key_cache.unsafe_ptr().offset(
-                loff + pos * self.config.kv_dim
-            )
-            var v_cache_row = self.state.value_cache.unsafe_ptr().offset(
-                loff + pos * self.config.kv_dim
-            )
-            memcpy(k_cache_row, self.state.k.data(), self.config.kv_dim)
-            memcpy(v_cache_row, self.state.v.data(), self.config.kv_dim)
-
-            # TODO: parallelize
-            for h in range(self.config.n_heads):
-                var q = self.state.q.unsafe_ptr().offset(
-                    h * self.config.head_size
-                )
-                var att = self.state.att.unsafe_ptr().offset(
-                    h * self.config.seq_len
-                )
-                for t in range(pos + 1):
-                    var k = self.state.key_cache.unsafe_ptr().offset(
-                        loff
-                        + t * self.config.kv_dim
-                        + (h // self.config.kv_mul) * self.config.head_size
-                    )
-                    var score: Float32 = 0.0
-                    for i in range(self.config.head_size):
-                        score += q.load[width=1](i) * k.load[width=1](i)
-
-                    score /= sqrt(self.config.head_size)
-                    att.store(t, score)
-
-                softmax(att, 0, pos + 1)
-
-                var xb = self.state.xb.unsafe_ptr().offset(
-                    h * self.config.head_size
-                )
-                memset_zero(xb, self.config.head_size)
-                for t in range(pos + 1):
-                    var v = self.state.value_cache.unsafe_ptr().offset(
-                        loff
-                        + t * self.config.kv_dim
-                        + (h // self.config.kv_mul) * self.config.head_size
-                    )
-                    var a = self.state.att.load[width=1](t)
-                    for i in range(self.config.head_size):
-                        xb.store[width=1](
-                            i, xb.load[width=1](i) + a * v.load[width=1](i)
-                        )
-
-            self.state.x_q.quantize(
-                TensorSlice[DType.float32](self.state.xb, 0)
-            )
-            matmul(
-                self.state.xb2,
-                self.state.x_q,
-                QuantizedTensorSlice(self.weights.wo, l),
-            )
-
-            for i in range(self.config.dim):
-                var x_i = self.state.x.load[width=1](i)
-                var xb2_i = self.state.xb2.load[width=1](i)
-                self.state.x.store[width=1](i, x_i + xb2_i)
-
-            rmsnorm(
-                self.state.xb.unsafe_ptr(),
-                self.state.x.unsafe_ptr(),
-                self.weights.rms_ffn_weight.unsafe_ptr().offset(l * dim),
-                dim,
-            )
-
-            self.state.x_q.quantize(
-                TensorSlice[DType.float32](self.state.xb, 0)
-            )
-            matmul(
-                self.state.hb,
-                self.state.x_q,
-                QuantizedTensorSlice(self.weights.w1, l),
-            )
-            matmul(
-                self.state.hb2,
-                self.state.x_q,
-                QuantizedTensorSlice(self.weights.w3, l),
-            )
-
-            # SwiGLU
-            for i in range(self.config.hidden_dim):
-                var val = self.state.hb.load[width=1](i)
-                val *= 1.0 / (1.0 + exp(-val))
-                val *= self.state.hb2.load[width=1](i)
-                self.state.hb.store[width=1](i, val)
-
-            self.state.hb_q.quantize(
-                TensorSlice[DType.float32](self.state.hb, 0)
-            )
-            matmul(
-                self.state.xb2,
-                self.state.hb_q,
-                QuantizedTensorSlice(self.weights.w2, l),
-            )
-
-            for i in range(self.config.dim):
-                var x_i = self.state.x.load[width=1](i)
-                var xb_i = self.state.xb.load[width=1](i)
-                self.state.x.store[width=1](i, x_i + xb_i)
+    state.x_q.quantize(state.x)
+    # Classifier into logits
+    matmul(state.logits, state.x_q, weights.wcls)
 
 
 def test():
@@ -1400,8 +1412,8 @@ def test():
                 k.unsafe_ptr(), v.unsafe_ptr()
             ),
             x_q,
-            InlineArray[UnsafePointer[QuantizedTensorSlice], 2](
-                UnsafePointer(wk_slice), UnsafePointer(wv_slice)
+            InlineArray[QuantizedTensorSlice, 2](
+                wk_slice, wv_slice
             ),
             kv_dim,
             dim,
@@ -1442,13 +1454,15 @@ def test():
     def test_transformer():
         print("Transformer test")
 
-        var transformer = Transformer("llama3_8b_instruct_q80.bin")
-        var tok = Tokenizer(transformer.config.vocab_size, "tokenizer.bin")
+        var config = Config("llama3_8b_instruct_q80.bin", True)
+        var weights = TransformerWeights("llama3_8b_instruct_q80.bin", config)
+        var tok = Tokenizer(config.vocab_size, "tokenizer.bin")
 
+
+        var state = RunState(config)
         var prompt_tokens = List[Int]()
-        bpe_encode(prompt_tokens, "Hello, how are you?", tok)
+        bpe_encode(prompt_tokens, "Hello, how are you? I'm", tok)
 
-        var start = 0
         var next_token = 0
         var token = 1
 
@@ -1457,7 +1471,7 @@ def test():
         var steps = 100
         while pos < steps:
             # Forward the transformer to get logits for the next token
-            transformer.forward(token, pos)
+            transformer(token, pos, config, state, weights)
 
             if pos < len(prompt_tokens):
                 next_token = prompt_tokens[pos]
@@ -1465,7 +1479,7 @@ def test():
                 # # Sample the next token
                 # if temperature == 0.0:
                 # Greedy argmax sampling: take the token with the highest probability
-                next_token = int(transformer.state.logits.argmax()[0])
+                next_token = int(state.logits.argmax()[0])
                 # else:
                 #     # Apply the temperature to the logits
                 #     for q in range(config.vocab_size):
@@ -1490,12 +1504,13 @@ def test():
             token = next_token
             pos += 1
 
-            print("Transformer test passed")
+        print("Transformer test passed")
 
     # test_quantized_tensor()
     # test_bpe_encode()
     # test_transformer_weights()
-    test_batch_matmul_i8()
+    # test_batch_matmul_i8()
+    test_transformer()
 
 
 def main():
