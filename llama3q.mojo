@@ -1,6 +1,6 @@
-from tensor import Tensor, TensorShape, rand
+from tensor import Tensor, TensorShape
 from algorithm import vectorize, parallelize
-from math import abs, round, pow, cos, sin, sqrt, exp
+from math import cos, sin, sqrt, exp
 from sys.info import num_performance_cores
 from memory import memset
 
@@ -30,7 +30,7 @@ struct TensorSlice[type: DType]:
     fn __init__(inout self, t: Tensor[type], layer: Int) raises:
         var num_layer_elements = t.shape().num_elements() / t.dim(0)
 
-        self._data = t.data().offset(layer * num_layer_elements)
+        self._data = t.unsafe_ptr().offset(layer * num_layer_elements)
 
         if t.rank() == 2:
             self._shape = TensorShape(t.dim(1))
@@ -43,7 +43,7 @@ struct TensorSlice[type: DType]:
         var num_layer_elements = t.shape().num_elements() / t.dim(0)
         var num_row_elements = num_layer_elements / t.dim(1)
 
-        self._data = t.data().offset(
+        self._data = t.unsafe_ptr().offset(
             layer * num_layer_elements + row * num_row_elements
         )
 
@@ -188,7 +188,7 @@ struct QuantizedTensor:
                 var dequantized_lane = dequantized.load[width=simd_width](
                     group * self._group_size + i
                 )
-                var quantized_lane = round[DType.float32, simd_width](
+                var quantized_lane = round(
                     dequantized_lane / scale_factor
                 ).cast[DType.int8]()
                 self._quantized.store[width=simd_width](
@@ -298,10 +298,10 @@ struct QuantizedTensorSlice:
             0
         )
 
-        self._quantized = qt._quantized.data().offset(
+        self._quantized = qt._quantized.unsafe_ptr().offset(
             layer * num_layer_quantized_elements
         )
-        self._scale = qt._scale.data().offset(layer * num_layer_scale_elements)
+        self._scale = qt._scale.unsafe_ptr().offset(layer * num_layer_scale_elements)
 
         if qt._quantized.rank() == 2:
             self._shape = TensorShape(qt._quantized.dim(1))
@@ -326,11 +326,11 @@ struct QuantizedTensorSlice:
         )
         var num_row_scale_elements = num_layer_scale_elements / qt._scale.dim(1)
 
-        self._quantized = qt._quantized.data().offset(
+        self._quantized = qt._quantized.unsafe_ptr().offset(
             layer * num_layer_quantized_elements
             + row * num_row_quantized_elements
         )
-        self._scale = qt._scale.data().offset(
+        self._scale = qt._scale.unsafe_ptr().offset(
             layer * num_layer_scale_elements + row * num_row_scale_elements
         )
 
@@ -377,18 +377,18 @@ fn wrap(token: String) -> String:
     alias c = String("'")
     alias d = String('"')
     if token == a:
-        return String(List[Int8](0x0A, 0))
+        return String(List[UInt8](0x0A, 0))
     if token == b:
-        return String(List[Int8](0x09, 0))
+        return String(List[UInt8](0x09, 0))
     if token == c:
-        return String(List[Int8](0x27, 0))
+        return String(List[UInt8](0x27, 0))
     if token == d:
-        return String(List[Int8](0x22, 0))
+        return String(List[UInt8](0x22, 0))
 
     return token
 
 
-fn string_from_bytes(owned bytes: List[Int8]) -> String:
+fn string_from_bytes(owned bytes: List[UInt8]) -> String:
     """Convert a list of bytes to a string.
 
     Args:
@@ -463,9 +463,9 @@ fn str_concat(s1: String, s2: String) -> String:
     """
     var l1 = len(s1)
     var l2 = len(s2)
-    var str = List[Int8](capacity=l1 + l2 + 1)
-    memcpy(str.data, s1._buffer.data, l1)
-    memcpy(str.data + l1, s2._buffer.data, l2)
+    var str = List[UInt8](capacity=l1 + l2 + 1)
+    memcpy(str.unsafe_ptr(), s1.unsafe_uint8_ptr(), l1)
+    memcpy(str.unsafe_ptr() + l1, s2.unsafe_uint8_ptr(), l2)
     str[l1 + l2] = 0
     str.size = l1 + l2 + 1
     return str^
@@ -724,7 +724,7 @@ struct TransformerWeights:
                         raise Error("EOF while reading weights")
                     var weight_size = weight_bytes.size
                     bytes_read += weight_size
-                    var weight_data = weight_bytes.steal_data()
+                    var weight_data = weight_bytes.steal_data().bitcast[Int8]()
 
                     # read scale factors
                     var scale_bytes = f.read_bytes(
@@ -794,7 +794,7 @@ struct TransformerWeights:
             print("token_embedding_table done, bytes read:", bytes_read)
             self.q_token_embedding_table.dequantize(
                 TensorSlice(
-                    self.token_embedding_table.data(),
+                    self.token_embedding_table.unsafe_ptr(),
                     TensorShape(config.vocab_size, config.dim),
                 )
             )
@@ -900,7 +900,7 @@ fn rmsnorm(
     x: Tensor[DType.float32],
     weight: Tensor[DType.float32],
 ):
-    rmsnorm(o._ptr, x.data(), weight.data(), weight.dim(weight.rank() - 1))
+    rmsnorm(o._ptr, x.unsafe_ptr(), weight.unsafe_ptr(), weight.dim(weight.rank() - 1))
 
 
 @always_inline
@@ -909,12 +909,12 @@ fn rmsnorm(
     x: Tensor[DType.float32],
     weight: TensorSlice[DType.float32],
 ):
-    rmsnorm(o._ptr, x.data(), weight.data(), weight.dim(weight.rank() - 1))
+    rmsnorm(o._ptr, x.unsafe_ptr(), weight.data(), weight.dim(weight.rank() - 1))
 
 
 @always_inline
 fn softmax(inout x: Tensor[DType.float32]) -> None:
-    softmax(x.data(), 0, x.dim(0))
+    softmax(x.unsafe_ptr(), 0, x.dim(0))
 
 
 @always_inline
@@ -954,15 +954,15 @@ fn softmax(x: DTypePointer[DType.float32], start: Int, end: Int):
 fn batch_matmul_fp32[
     n: Int
 ](
-    C: StaticTuple[DTypePointer[DType.float32], n],
+    C: InlineArray[DTypePointer[DType.float32], n],
     A: DTypePointer[DType.float32],
-    B: StaticTuple[DTypePointer[DType.float32], n],
+    B: InlineArray[DTypePointer[DType.float32], n],
     rows: Int,
     cols: Int,
 ):
     @parameter
     fn compute_row(i: Int):
-        var tmp = StaticTuple[Accumulator[DType.float32, nelts_f32], n]()
+        var tmp = InlineArray[Accumulator[DType.float32, nelts_f32], n]()
 
         @unroll
         for k in range(n):
@@ -1270,7 +1270,7 @@ def test():
         var qt = QuantizedTensor(TensorShape(N), group_size)
         var qt_naive = QuantizedTensor(TensorShape(N), group_size)
 
-        var x = rand[DType.float32](5, N) - 0.5
+        var x = Tensor[DType.float32].rand(TensorShape(5, N)) - 0.5
 
         var x_1 = TensorSlice[DType.float32](x, 0)
         var x_1_naive = TensorSlice[DType.float32](x, 0)
@@ -1409,6 +1409,59 @@ def test():
         _ = v
 
         print("Quantized batch matmul test passed")
+    
+    def test_transformer():
+        print("Transformer test")
+        
+        var transformer = Transformer("llama3_8b_instruct_q80.bin")
+        var tok = Tokenizer(transformer.config.vocab_size, "tokenizer.bin")
+
+        var prompt_tokens = List[Int]()
+        bpe_encode(prompt_tokens, "Hello, how are you?", tok)
+
+        var start = 0
+        var next_token = 0
+        var token = 1
+
+        # Position in the sequence
+        var pos = 0
+        var steps = 100
+        while pos < steps:
+            # Forward the transformer to get logits for the next token
+            transformer.forward(token, pos)
+
+            if pos < len(prompt_tokens):
+                next_token = prompt_tokens[pos]
+            else:
+                # # Sample the next token
+                # if temperature == 0.0:
+                # Greedy argmax sampling: take the token with the highest probability
+                next_token = int(transformer.state.logits.argmax()[0])
+                # else:
+                #     # Apply the temperature to the logits
+                #     for q in range(config.vocab_size):
+                #         state.logits[q] = state.logits[q] / temperature
+
+                #     # Apply softmax to the logits to get the probabilities for the next token
+                #     softmax(state.logits)
+                #     # Sample from this distribution to get the next token
+                #     next_token = sample(state.logits)
+
+                # Finish generating when EOS, BOS appear
+                if next_token == 1 or next_token == 2:
+                    break
+
+            var token_str: String = tok.vocab[next_token]
+            if token == 1 and token_str._buffer[0] == ord(" "):
+                token_str = token_str[1:]
+
+            print(token_str, end="")
+
+            # Advance forward
+            token = next_token
+            pos += 1
+            
+            print("Transformer test passed")
 
     # test_quantized_tensor()
     # test_bpe_encode()
