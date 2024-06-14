@@ -304,7 +304,7 @@ struct QuantizedTensorSlice:
         var num_layer_quantized_elements = qt._quantized.num_elements() / qt._quantized.dim(
             0
         )
-        var num_layer_scale_elements = qt._scale.num_elements() / qt._scale.dim(
+        var num_layer_scale_elements = qt._scale.num_elements() / qt._quantized.dim(
             0
         )
 
@@ -1151,12 +1151,12 @@ fn transformer(
     var content_row = weights.token_embedding_table.unsafe_ptr().offset(token * dim)
     memcpy(state.x.unsafe_ptr(), content_row, dim)
 
-    print("state.x: ", state.x)
+    # print("state.x: ", state.x)
 
     for l in range(config.n_layers):
         rmsnorm(state.xb, state.x, TensorSlice(weights.rms_att_weight, l))
 
-        print("state.xb: ", state.xb)
+        # print("state.xb: ", state.xb)
 
         var loff = l * config.seq_len * kv_dim
         state.k = TensorSlice(state.key_cache, l, pos)
@@ -1201,7 +1201,7 @@ fn transformer(
 
         memset_zero(state.xb.unsafe_ptr(), state.xb.num_elements())
 
-        print("state.q: ", state.q)
+        # print("state.q: ", state.q)
 
 
         # Multihead attention. Iterate over all heads in parallel.
@@ -1476,10 +1476,10 @@ def test():
 
         var state = RunState(config)
         var prompt_tokens = List[Int]()
-        bpe_encode(prompt_tokens, "Hello, how are you? I'm", tok)
+        bpe_encode(prompt_tokens, "The capital city of China is", tok)
 
         var next_token = 0
-        var token = 1
+        var token = 128000  # BOS
 
         # Position in the sequence
         var pos = 0
@@ -1494,7 +1494,7 @@ def test():
                 # # Sample the next token
                 # if temperature == 0.0:
                 # Greedy argmax sampling: take the token with the highest probability
-                print(state.logits)
+                # print(state.logits)
                 next_token = int(state.logits.argmax()[0])
                 # else:
                 #     # Apply the temperature to the logits
@@ -1510,7 +1510,7 @@ def test():
                 if next_token == 1 or next_token == 2:
                     break
 
-            print(next_token)
+            # print(next_token)
 
             var token_str: String = tok.vocab[next_token]
 
@@ -1519,10 +1519,11 @@ def test():
 
             print(token_str, end="")
 
-            # Advance forward
+            # Advance forwardnn
             token = next_token
             pos += 1
 
+        print()
         print("Transformer test passed")
 
     # test_quantized_tensor()
