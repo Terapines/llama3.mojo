@@ -1,8 +1,9 @@
 from tensor import Tensor, TensorShape
-from algorithm import vectorize, parallelize
+from algorithm import vectorize, parallelize, parallel_memcpy
 from math import cos, sin, sqrt, exp
 from sys.info import num_performance_cores
 from memory import memset
+import time
 
 var workers = num_performance_cores()
 alias nelts_q8 = (4 * simdwidthof[Int8]())
@@ -471,24 +472,6 @@ struct Tokenizer:
             return index.value()[]
         return -1
 
-
-fn str_concat(s1: String, s2: String) -> String:
-    """Concatenate two strings.
-
-    Args:
-        s1: The first string.
-        s2: The second string.
-    """
-    var l1 = len(s1)
-    var l2 = len(s2)
-    var str = List[UInt8](capacity=l1 + l2 + 1)
-    memcpy(str.unsafe_ptr(), s1.unsafe_uint8_ptr(), l1)
-    memcpy(str.unsafe_ptr() + l1, s2.unsafe_uint8_ptr(), l2)
-    str[l1 + l2] = 0
-    str.size = l1 + l2 + 1
-    return str^
-
-
 fn bpe_encode(inout tokens: List[Int], text: String, tok: Tokenizer):
     for pos in range(len(text)):
         var char = text[pos]
@@ -504,9 +487,6 @@ fn bpe_encode(inout tokens: List[Int], text: String, tok: Tokenizer):
         var best_idx = -1
 
         for i in range(len(tokens) - 1):
-            # Check if we can merge the pair (tokens[i], tokens[i+1])
-            # var str = str_concat(tok.vocab[tokens[i]], tok.vocab[tokens[i + 1]])
-            # TODO: check: do we support add operator for string now?
             var str = tok.vocab[tokens[i]] + tok.vocab[tokens[i + 1]]
             var id = tok.find(str)
             if id != -1 and tok.vocab_scores[id] > best_score:
@@ -689,6 +669,9 @@ struct TransformerWeights:
     var rms_final_weight: Tensor[DType.float32]
     var wcls: QuantizedTensor
 
+    var freq_cis_real: Tensor[DType.float32]
+    var freq_cis_imag: Tensor[DType.float32]
+
     fn __init__(inout self, file_name: String, config: Config) raises:
         var bytes_read = 0
         with open(file_name, "rb") as f:
@@ -760,10 +743,10 @@ struct TransformerWeights:
                     bytes_read += scale_size
                     var scale_data = scale_bytes.steal_data().bitcast[Float32]()
 
-                    memcpy(
+                    parallel_memcpy(
                         tensor_layer.quantized_data(), weight_data, weight_size
                     )
-                    memcpy(
+                    parallel_memcpy(
                         tensor_layer.scale_data(),
                         scale_data,
                         scale_size // sizeof[DType.float32](),
@@ -853,8 +836,21 @@ struct TransformerWeights:
                 )
             print("wcls done, bytes read:", bytes_read)
 
+        # calc freq_cis_real and freq_cis_imag
+        # TODO: this can be optimized
+        var freq = Tensor[DType.float32](TensorShape(config.head_size // 2))
+        for i in range(config.head_size // 2):
+            freq.store[width=1](i, 1.0 / pow(500000.0, 2.0 * i / config.head_size))
+        self.freq_cis_real = Tensor[DType.float32](TensorShape(config.seq_len, config.head_size // 2))
+        self.freq_cis_imag = Tensor[DType.float32](TensorShape(config.seq_len, config.head_size // 2))
+        for i in range(config.seq_len):
+            for j in range(config.head_size // 2):
+                var val = i * freq.load[width=1](j)
+                self.freq_cis_real.store[width=1](i * (config.head_size // 2) + j, math.cos(val))
+                self.freq_cis_imag.store[width=1](i * (config.head_size // 2) + j, math.sin(val))
 
-# From: llama2.mojo
+
+# From: llama2.mojo (https://github.com/tairov/llama2.mojo)
 @value
 @register_passable
 struct Accumulator[T: DType, width: Int](CollectionElement):
@@ -1068,7 +1064,7 @@ fn batch_matmul_i8[
 
     parallelize[compute_row](rows, workers)
 
-
+@always_inline
 fn matmul(
     inout C: Tensor[DType.float32],
     borrowed A: QuantizedTensor,
@@ -1082,7 +1078,7 @@ fn matmul(
         B.dim(1),
     )
 
-
+@always_inline
 fn matmul(
     C: TensorSlice[DType.float32],
     borrowed A: QuantizedTensor,
@@ -1096,16 +1092,13 @@ fn matmul(
         B.dim(1),
     )
 
-# fn matmul(
-#     C: 
-# )
-
 # Apply RoPE rotation to the q and k vectors for each head
 # rotate odd and even dim
 @always_inline
 fn rope_rotation_llama(
     inout state: RunState,
-    pos: Int,
+    freq_cis_real_row: TensorSlice[DType.float32],
+    freq_cis_imag_row: TensorSlice[DType.float32],
     config: Config,
 ) -> None:
     # stories model, llama2
@@ -1116,10 +1109,8 @@ fn rope_rotation_llama(
         # Simple vectorization with (head_size // 2) steps gave junk transformer output.
         # Maybe because the nelt ranges end up overlapping between the steps.
         for j in range(0, config.head_size, 2):
-            var freq = 1.0 / pow(500000.0, j / config.head_size)
-            var val = pos * freq
-            var fcr = cos(val)
-            var fci = sin(val)
+            var fcr = freq_cis_real_row[j // 2]
+            var fci = freq_cis_imag_row[j // 2]
             var q0 = state.q[i * head_size + j]
             var q1 = state.q[i * head_size + j + 1]
             state.q[i * head_size + j] = q0 * fcr - q1 * fci
@@ -1151,18 +1142,17 @@ fn transformer(
     var content_row = weights.token_embedding_table.unsafe_ptr().offset(token * dim)
     memcpy(state.x.unsafe_ptr(), content_row, dim)
 
-    # print("state.x: ", state.x)
+    # Pluck out the "pos" row of freq_cis_real and freq_cis_imag
+    var freq_cis_real_row = TensorSlice(weights.freq_cis_real, pos)
+    var freq_cis_imag_row = TensorSlice(weights.freq_cis_imag, pos)
 
     for l in range(config.n_layers):
         rmsnorm(state.xb, state.x, TensorSlice(weights.rms_att_weight, l))
-
-        # print("state.xb: ", state.xb)
 
         var loff = l * config.seq_len * kv_dim
         state.k = TensorSlice(state.key_cache, l, pos)
         state.v = TensorSlice(state.value_cache, l, pos)
 
-        # Quantize x
         state.x_q.quantize(state.xb)
 
         if kv_dim == dim:
@@ -1197,12 +1187,9 @@ fn transformer(
                 dim
             )
         
-        rope_rotation_llama(state, pos, config)
+        rope_rotation_llama(state, freq_cis_real_row, freq_cis_imag_row, config)
 
         memset_zero(state.xb.unsafe_ptr(), state.xb.num_elements())
-
-        # print("state.q: ", state.q)
-
 
         # Multihead attention. Iterate over all heads in parallel.
         @parameter
@@ -1299,10 +1286,7 @@ fn transformer(
     rmsnorm(state.x, state.x, weights.rms_final_weight)
 
     state.x_q.quantize(state.x)
-    # print("final state.x: ", state.x)
-    # print("wcls:", weights.wcls)
-    # print("state.x_q:", state.x_q)
-    # print("state.logits:", state.logits)
+
     # Classifier into logits
     matmul(state.logits, state.x_q, QuantizedTensorSlice(weights.wcls, 0))
 
@@ -1484,6 +1468,7 @@ def test():
         # Position in the sequence
         var pos = 0
         var steps = 100
+        var start = 0
         while pos < steps:
             # Forward the transformer to get logits for the next token
             transformer(token, pos, config, state, weights)
@@ -1522,6 +1507,12 @@ def test():
             # Advance forwardnn
             token = next_token
             pos += 1
+
+            if start == 0:
+                start = time.now() // 1_000_000
+        
+        var end = time.now() // 1_000_000
+        print("\nAchieved tok/s: ", (pos - 1) / (end - start) * 1000)
 
         print()
         print("Transformer test passed")
