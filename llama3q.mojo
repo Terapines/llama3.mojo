@@ -2,6 +2,7 @@ from tensor import Tensor, TensorShape
 from algorithm import vectorize, parallelize, parallel_memcpy
 from math import cos, sin, sqrt, exp
 from sys.info import num_performance_cores
+from sys.arg import argv
 from memory import memset
 import time
 
@@ -758,6 +759,7 @@ struct TransformerWeights:
 
                 return tensor
 
+            print("Reading weights...")
             # 256 bytes for the config header
             var config_header_bytes = f.read_bytes(NUM_CONFIG_HEADER_BYTES)
             bytes_read += config_header_bytes.size
@@ -1290,6 +1292,17 @@ fn transformer(
     # Classifier into logits
     matmul(state.logits, state.x_q, QuantizedTensorSlice(weights.wcls, 0))
 
+fn sample(probabilities: Tensor[DType.float32]) -> Int:
+    var n = probabilities.dim(0)
+    # Sample index from probabilities, they must sum to 1
+    # get random value within (min, max) float32 range
+    var r = Tensor[DType.float32].rand(1)
+    var cdf: Float32 = 0.0
+    for i in range(n):
+        cdf += probabilities[i]
+        if r[0] < cdf:
+            return i
+    return n - 1  # In case of rounding errors
 
 def test():
     def test_quantized_tensor():
@@ -1476,26 +1489,11 @@ def test():
             if pos < len(prompt_tokens):
                 next_token = prompt_tokens[pos]
             else:
-                # # Sample the next token
-                # if temperature == 0.0:
-                # Greedy argmax sampling: take the token with the highest probability
-                # print(state.logits)
                 next_token = int(state.logits.argmax()[0])
-                # else:
-                #     # Apply the temperature to the logits
-                #     for q in range(config.vocab_size):
-                #         state.logits[q] = state.logits[q] / temperature
-
-                #     # Apply softmax to the logits to get the probabilities for the next token
-                #     softmax(state.logits)
-                #     # Sample from this distribution to get the next token
-                #     next_token = sample(state.logits)
 
                 # Finish generating when EOS, BOS appear
                 if next_token == 1 or next_token == 2:
                     break
-
-            # print(next_token)
 
             var token_str: String = tok.vocab[next_token]
 
@@ -1504,7 +1502,7 @@ def test():
 
             print(token_str, end="")
 
-            # Advance forwardnn
+            # Advance forward
             token = next_token
             pos += 1
 
@@ -1523,7 +1521,147 @@ def test():
     # test_batch_matmul_i8()
     test_transformer()
 
+fn print_usage():
+    print("Usage: mojo llama2.mojo <checkpoint> [options]")
+    print(
+        'Example: mojo llama2.mojo stories15M.bin -s 99 -n 256 -t 0.5 -i "Llama'
+        ' is an animal"'
+    )
+    print("Options:")
+    print("  -s <int>    random seed, default time.now()")
+    print("  -t <float>  temperature in [0,1.0], default 1.0")
+    print(
+        "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len"
+    )
+    print("  -i <string> input prompt")
+    print("  -z          tokenizer path")
+    print("  -j          number of workers to use, default num_cores()")
 
 def main():
     workers = num_performance_cores()
-    test()
+    # test()
+    var tokenizer = StringRef("tokenizer.bin")
+    var checkpoint = StringRef("llama3_8b_instruct_q80.bin")
+    var temperature = 0.9
+    var steps = 256
+    var prompt = String("")
+    var rng_seed: Int = time.now()
+    var print_config = 0
+
+    @parameter
+    fn argparse() raises -> Int:
+        var args = argv()
+        if len(args) < 2:
+            return 0
+        checkpoint = args[1]
+        for i in range(2, len(args), 2):
+            if args[i] == "-p":
+                print("Option not supported: ", args[i])
+            if args[i] == "-n":
+                steps = atol(args[i + 1])
+            if args[i] == "-z":
+                tokenizer = args[i + 1]
+            if args[i] == "-s":
+                rng_seed = atol(args[i + 1])
+            if args[i] == "-i":
+                prompt = args[i + 1]
+            if args[i] == "-j":
+                workers = atol(args[i + 1])
+            if args[i] == "-pc":
+                print_config = atol(args[i + 1])
+            if args[i] == "-t":
+                var val = args[i + 1]
+                temperature = 0.0
+                # hacky parse float, keep only 1 digit
+                for c in range(0, len(val)):
+                    if val[c] == ".":
+                        temperature += atol(val[c + 1]) * 0.1
+                        break
+                    else:
+                        temperature = atol(val[c])
+                if temperature < -1e9 or temperature > (1 + 1e9):
+                    print("Wrong temperature value", temperature)
+                    return 0
+        return 1
+
+    var res = argparse()
+    if res == 0:
+        print_usage()
+        return
+
+    print("num parallel workers:", workers, " SIMD width: float32:", nelts_f32, " int32:", nelts_q32, " int8:", nelts_q8)
+    random.seed(rng_seed)
+    var config = Config(checkpoint, print_config == 1)
+    var weights = TransformerWeights(checkpoint, config)
+
+    if steps <= 0 or steps > config.seq_len:
+        steps = config.seq_len
+
+    var tok = Tokenizer(config.vocab_size, tokenizer)
+
+    print(
+        "n layers:",
+        config.n_layers,
+        "| vocab size:",
+        tok.vocab_size,
+    )
+
+    # Create and initialize the application RunState
+    var state = RunState(config)
+
+    # Process the prompt, if any
+    var prompt_tokens = List[Int]()
+
+    if prompt:
+        bpe_encode(prompt_tokens, prompt, tok)
+
+    # Start the main loop
+    var start = 0  # Used to time our code, only initialized after the first iteration
+    var next_token = 0  # Will store the next token in the sequence
+    # Initialize with token 128000 (=BOS), as done in Llama-3 sentencepiece tokenizer
+    var token = 128000
+
+    # Position in the sequence
+    var pos = 0
+    while pos < steps:
+        # Forward the transformer to get logits for the next token
+        transformer(token, pos, config, state, weights)
+
+        if pos < len(prompt_tokens):
+            next_token = prompt_tokens[pos]
+        else:
+            # Sample the next token
+            if temperature == 0.0:
+                # Greedy argmax sampling: take the token with the highest probability
+                next_token = int(state.logits.argmax()[0])
+            else:
+                # Apply the temperature to the logits
+                for q in range(config.vocab_size):
+                    state.logits[q] = state.logits[q] / temperature
+
+                # Apply softmax to the logits to get the probabilities for the next token
+                softmax(state.logits)
+                # Sample from this distribution to get the next token
+                next_token = sample(state.logits)
+
+            # Finish generating when EOS, EOT appear
+            if next_token == 128001 or next_token == 128009:
+                break
+
+        var token_str: String = tok.vocab[next_token]
+        # if token == 128000 and token_str._buffer[0] == ord(" "):
+        #     token_str = token_str[1:]
+
+        print(token_str, end="")
+
+        # Advance forward
+        token = next_token
+        pos += 1
+
+        if start == 0:
+            start = time.now() // 1_000_000
+
+    var end = time.now() // 1_000_000
+    print("\nachieved tok/s: ", (pos - 1) / (end - start) * 1000)
+
+
