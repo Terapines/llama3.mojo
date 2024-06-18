@@ -1540,8 +1540,8 @@ fn print_usage():
 def main():
     workers = num_performance_cores()
     # test()
-    var tokenizer = StringRef("tokenizer.bin")
-    var checkpoint = StringRef("llama3_8b_instruct_q80.bin")
+    var tokenizer = String("tokenizer.bin")
+    var checkpoint = String("llama3_8b_instruct_q80.bin")
     var temperature = 0.9
     var steps = 256
     var prompt = String("")
@@ -1570,15 +1570,7 @@ def main():
             if args[i] == "-pc":
                 print_config = atol(args[i + 1])
             if args[i] == "-t":
-                var val = args[i + 1]
-                temperature = 0.0
-                # hacky parse float, keep only 1 digit
-                for c in range(0, len(val)):
-                    if val[c] == ".":
-                        temperature += atol(val[c + 1]) * 0.1
-                        break
-                    else:
-                        temperature = atol(val[c])
+                temperature = atof(args[i + 1])
                 if temperature < -1e9 or temperature > (1 + 1e9):
                     print("Wrong temperature value", temperature)
                     return 0
