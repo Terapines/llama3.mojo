@@ -152,7 +152,7 @@ struct QuantizedTensor:
             ]()
             dequantized.store[width=1](i, quantized_lane * scale_factor)
 
-    fn quantize(inout self, owned dequantized: TensorSlice[DType.float32]) raises:
+    fn quantize(inout self, dequantized: TensorSlice[DType.float32]) raises:
         """Quantize the `dequantized` and update self.
 
         Args:
@@ -215,7 +215,7 @@ struct QuantizedTensor:
         return self._quantized.rank()
 
     fn quantize_naive(
-        inout self, owned dequantized: TensorSlice[DType.float32]
+        inout self, dequantized: TensorSlice[DType.float32]
     ) raises:
         """Quantize the `dequantized` and update self. Uses a naive implementation.
 
